@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ============== 默认值(交互时作为回车默认项) ==============
-DEFAULT_BASE_URL="https://opencode.2020713.xyz"
+# 注意: API Key 与 base_url 为必填项, 无默认值。
 DEFAULT_MODEL="gpt-5.5"
 DEFAULT_REVIEW_MODEL="gpt-5.5"
 DEFAULT_REASONING_EFFORT="xhigh"
@@ -88,7 +88,7 @@ mask_key() { printf '%s********\n' "${1:0:8}"; }   # 只显示前8位
 echo
 info "=========== Codex 配置参数 ==========="
 ask CODEX_API_KEY          "  API Key (OPENAI_API_KEY)"   ""                    1
-ask CODEX_BASE_URL         "  代理地址 (base_url)"        "${DEFAULT_BASE_URL}" 0
+ask CODEX_BASE_URL         "  代理地址 (base_url)"        ""                    0
 ask CODEX_MODEL            "  模型 (model)"               "${DEFAULT_MODEL}"    0
 ask CODEX_REVIEW_MODEL     "  审查模型 (review_model)"    "${DEFAULT_REVIEW_MODEL}" 0
 ask CODEX_REASONING_EFFORT "  推理强度 (reasoning_effort)" "${DEFAULT_REASONING_EFFORT}" 0

@@ -58,11 +58,11 @@ less deploy-codex.sh
 sudo bash deploy-codex.sh
 ```
 
-运行后会依次提示输入，**回车采用方括号内的默认值**：
+运行后会依次提示输入，**回车采用方括号内的默认值**（API Key 和 base_url 为必填，无默认值）：
 
 ```text
   API Key (OPENAI_API_KEY) (输入不回显): _
-  代理地址 (base_url) [默认: https://opencode.2020713.xyz]: _
+  代理地址 (base_url): _
   模型 (model) [默认: gpt-5.5]: _
   审查模型 (review_model) [默认: gpt-5.5]: _
   推理强度 (reasoning_effort) [默认: xhigh]: _
@@ -102,7 +102,7 @@ sudo bash deploy-codex.sh          # 交互式
 | 环境变量 | 对应配置项 | 默认值 | 说明 |
 |----------|-----------|--------|------|
 | `CODEX_API_KEY` | `auth.json` → `OPENAI_API_KEY` | —（必填） | OpenAI API Key，隐藏输入 |
-| `CODEX_BASE_URL` | `base_url` | `https://opencode.2020713.xyz` | API 代理地址 |
+| `CODEX_BASE_URL` | `base_url` | —（必填） | API 代理地址 |
 | `CODEX_MODEL` | `model` | `gpt-5.5` | 模型名 |
 | `CODEX_REVIEW_MODEL` | `review_model` | `gpt-5.5` | 审查模型名 |
 | `CODEX_REASONING_EFFORT` | `model_reasoning_effort` | `xhigh` | 推理强度 |
