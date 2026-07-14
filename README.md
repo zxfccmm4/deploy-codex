@@ -13,7 +13,46 @@
 
 ## 快速开始
 
-### 方式一：交互式（推荐）
+有两种运行模式：
+
+- **交互式**：脚本会逐项提问，回车采用默认值，适合首次部署。
+- **非交互式**：用环境变量传参，一行命令跑完，适合 CI / 自动化。
+
+无论哪种模式，都得**先把脚本弄到服务器上**。下面按从快到慢给出三种方式。
+
+---
+
+### 方式一：远程一键（最快，无需下载脚本）
+
+直接从 GitHub 拉取脚本并通过管道执行。**必须用环境变量传参**（管道模式下脚本无法交互提问）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh \
+  | sudo CODEX_API_KEY="sk-xxxx" bash
+```
+
+> 如果只想跑交互式，请改用方式二或方式三，先下载脚本到本地。
+
+---
+
+### 方式二：下载脚本 + 交互式运行（推荐）
+
+先把脚本下载到服务器，再用交互模式运行——能看到脚本内容、可重复执行，且支持交互提问。
+
+**第 1 步：下载脚本**
+
+```bash
+curl -fsSL -o deploy-codex.sh \
+  https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh
+```
+
+（可选）建议先看一眼内容再执行：
+
+```bash
+less deploy-codex.sh
+```
+
+**第 2 步：运行**
 
 ```bash
 sudo bash deploy-codex.sh
@@ -34,9 +73,7 @@ sudo bash deploy-codex.sh
 
 > API Key 为隐藏输入（不回显），摘要中也只显示前 8 位。
 
-### 方式二：非交互 / 自动化
-
-通过环境变量传参，跳过所有提示，适合 CI 或远程一键部署：
+下载好的脚本也支持非交互式（用环境变量传参）：
 
 ```bash
 sudo CODEX_API_KEY="sk-xxxx" \
@@ -44,19 +81,18 @@ sudo CODEX_API_KEY="sk-xxxx" \
      bash deploy-codex.sh
 ```
 
-### 方式三：远程一键（curl | bash）
+---
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh \
-  | sudo CODEX_API_KEY="sk-xxxx" bash
-```
+### 方式三：克隆仓库后运行
 
-### 方式四：克隆后运行
+适合需要后续更新或贡献代码的场景：
 
 ```bash
 git clone https://github.com/zxfccmm4/deploy-codex.git
 cd deploy-codex
-sudo bash deploy-codex.sh
+sudo bash deploy-codex.sh          # 交互式
+# 或非交互式:
+# sudo CODEX_API_KEY="sk-xxxx" bash deploy-codex.sh
 ```
 
 ## 参数说明
