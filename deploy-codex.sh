@@ -2,23 +2,31 @@
 #
 # Codex CLI 一键部署脚本（Debian 12 / Ubuntu / macOS）
 #
-# 用法:
-#   1) 交互式(推荐):  sudo bash deploy-codex.sh
-#      运行后会依次提示输入 API Key、代理地址、模型等参数。
+# 一行命令即可完成安装与配置 (终端内可交互提问):
+#   curl -fsSL https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh \
+#     | sudo bash
+#   或加环境变量完全非交互 (适合 CI):
+#   curl -fsSL https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh \
+#     | sudo CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" bash
 #
-#   2) 非交互 / 自动化(用环境变量传参, 适合 CI 或 curl|bash):
-#        sudo CODEX_API_KEY="sk-xxxx" \
-#             CODEX_BASE_URL="https://your.proxy" \
-#             bash deploy-codex.sh
-#
-#   3) 远程一键:
-#        curl -fsSL http://your-host/deploy-codex.sh \
-#          | sudo CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" bash
+# 其他用法:
+#   下载后运行:   sudo bash deploy-codex.sh
+#   恢复备份:     sudo bash deploy-codex.sh --restore
 #
 # 平台支持:
 #   - Linux (Debian 12 / Ubuntu): apt-get + NodeSource
 #   - macOS (Darwin):             Homebrew (需先安装好 brew)
+#
 set -euo pipefail
+
+# 整个脚本体用 { } 包裹: bash 会在执行前一次性读完整个文件,
+# 避免 bash <(curl ...) 场景下 Ctrl+C 导致 curl 报 (23) 写错误;
+# 同时保证管道模式下 stdin 已被读完, read_tty 得以回退到 /dev/tty 交互提问。
+{
+SCRIPT_URL="https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh"
+INSTALL_CMD="curl -fsSL ${SCRIPT_URL} | sudo bash"
+
+trap 'printf "\n已取消。\n"; exit 130' INT
 
 # ============== 默认值(交互时作为回车默认项) ==============
 # 注意: API Key 与 base_url 为必填项, 无默认值。
@@ -29,6 +37,7 @@ DEFAULT_WIRE_API="responses"
 NODE_MAJOR="${NODE_MAJOR:-22}"        # Node 主版本 (Node 20 已于 2026-04 EOL, 默认装 22 LTS)
 NODE_MIN_MAJOR=20                     # 已安装 Node 大版本 >= 该值则跳过安装
 NPM_REGISTRY="${NPM_REGISTRY:-}"      # 可选 npm 镜像源, 如 https://registry.npmmirror.com
+KEEP_BACKUPS=5                        # 旧配置备份保留份数
 
 # ============== 颜色输出 ==============
 if [[ -t 1 ]]; then
@@ -42,13 +51,44 @@ ok()    { printf "${C_GREEN}[ OK ]${C_NC} %s\n"  "$*"; }
 warn()  { printf "${C_YELLOW}[WARN]${C_NC} %s\n" "$*"; }
 die()   { printf "${C_RED}[FAIL]${C_NC} %s\n" "$*" >&2; exit 1; }
 
+# ============== 交互式输入 ==============
+# stdin 是 tty 或 /dev/tty 可读都视为可交互 (支持 curl | bash 管道中提问)
+INTERACTIVE=1
+if [[ ! -t 0 ]] && [[ ! -r /dev/tty ]]; then
+    INTERACTIVE=0
+fi
+
+# read_tty <变量名> <提示语> <是否隐藏输入 0/1>
+# stdin 是管道时先从 stdin 读 (适配自动化测试), 否则回退到 /dev/tty 提问
+read_tty() {
+    local __var="$1" __prompt="$2" __secret="${3:-0}" __ans='' __got=1
+    if [[ ! -t 0 ]]; then
+        printf '%s' "${__prompt}"
+        if IFS= read -r __ans; then __got=0; fi
+    fi
+    if [[ "${__got}" -ne 0 ]] && [[ -r /dev/tty ]]; then
+        printf '%s' "${__prompt}" > /dev/tty
+        if [[ "${__secret}" -eq 1 ]]; then
+            IFS= read -r -s __ans < /dev/tty
+        else
+            IFS= read -r __ans < /dev/tty
+        fi
+        printf '\n' > /dev/tty
+    fi
+    eval "${__var}=\"\$__ans\""
+}
+
 # ============== 帮助 ==============
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    cat <<'EOF'
-用法: sudo bash deploy-codex.sh [选项]
+usage() {
+    cat <<EOF
+一行命令安装并配置 (终端内可交互提问):
+  ${INSTALL_CMD}
+  或加环境变量完全非交互 (适合 CI):
+  curl -fsSL ${SCRIPT_URL} | sudo CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" bash
 
 选项:
-  -h, --help   显示本帮助
+  -h, --help     显示本帮助
+  -r, --restore  用最近一次的备份恢复配置
 
 参数通过环境变量传入(优先级: 环境变量 > 交互输入 > 默认值):
   CODEX_API_KEY          必填, API Key
@@ -57,9 +97,13 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   CODEX_REVIEW_MODEL     审查模型, 默认 gpt-5.5
   CODEX_REASONING_EFFORT 推理强度, 默认 xhigh
   CODEX_WIRE_API         responses / chat, 默认 responses
-  NODE_MAJOR             Node 主版本, 默认 22
+  CODEX_HOME             Codex 配置目录, 默认 <家目录>/.codex
+  NODE_MAJOR             Node 主版本, 默认 22 (仅 Linux)
   NPM_REGISTRY           npm 镜像源, 如 https://registry.npmmirror.com
 EOF
+}
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
     exit 0
 fi
 
@@ -74,7 +118,7 @@ detect_os() {
 detect_os
 
 # ============== 前置检查 ==============
-[[ $EUID -eq 0 ]] || die "请使用 root 运行: sudo bash $0"
+[[ $EUID -eq 0 ]] || die "请使用 root 运行 (一行命令): ${INSTALL_CMD}"
 case "${OS}" in
     linux)
         [[ -f /etc/os-release ]] || die "未找到 /etc/os-release, 该脚本仅支持 Debian/Ubuntu"
@@ -105,13 +149,29 @@ elif command -v id >/dev/null 2>&1 && id -P "${TARGET_USER}" >/dev/null 2>&1; th
 else
     die "无法解析用户 ${TARGET_USER} 的家目录"
 fi
-CODEX_DIR="${TARGET_HOME}/.codex"
+CODEX_DIR="${CODEX_HOME:-${TARGET_HOME}/.codex}"
+
+# ============== 恢复最近一次备份 (--restore) ==============
+if [[ "${1:-}" == "-r" || "${1:-}" == "--restore" ]]; then
+    latest_backup=$(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null | head -1)
+    [[ -n "${latest_backup}" ]] || die "未找到任何备份 (${CODEX_DIR}.bak.*), 无需恢复"
+    echo
+    info "将用以下备份恢复: ${latest_backup}"
+    if [[ "${INTERACTIVE}" -eq 1 ]]; then
+        read_tty confirm "确认恢复? [Y/n]"
+        confirm="${confirm:-Y}"
+        [[ "${confirm}" =~ ^[Yy]$ ]] || die "已取消恢复"
+    fi
+    [[ -f "${latest_backup}/config.toml" ]] && cp -p "${latest_backup}/config.toml" "${CODEX_DIR}/config.toml"
+    [[ -f "${latest_backup}/auth.json" ]] && cp -p "${latest_backup}/auth.json" "${CODEX_DIR}/auth.json"
+    chown -R "${TARGET_USER}:${TARGET_USER}" "${CODEX_DIR}" 2>/dev/null || :
+    chmod 700 "${CODEX_DIR}"
+    chmod 600 "${CODEX_DIR}/auth.json" "${CODEX_DIR}/config.toml" 2>/dev/null || :
+    ok "已从 ${latest_backup} 恢复配置"
+    exit 0
+fi
 
 # ============== 交互式参数读取 ==============
-# 优先级: 环境变量 > 交互输入 > 默认值
-INTERACTIVE=1
-[[ -t 0 ]] || INTERACTIVE=0   # stdin 不是 tty (如管道) 则视为非交互
-
 # ask <变量名> <提示语> <默认值> <是否隐藏输入 0/1>
 ask() {
     local var="$1" msg="$2" def="${3:-}" secret="${4:-0}" val hint=""
@@ -122,13 +182,8 @@ ask() {
     # 2) 交互式终端 -> 提示输入
     if [[ "${INTERACTIVE}" -eq 1 ]]; then
         [[ -n "${def}" ]] && hint=" [默认: ${def}]"
-        if [[ "${secret}" -eq 1 ]]; then
-            read -r -s -p "${msg}${hint} (输入不回显): " val || :
-            echo
-        else
-            read -r -p "${msg}${hint}: " val || :
-            val="${val:-${def}}"
-        fi
+        read_tty val "${msg}${hint}" "${secret}"
+        val="${val:-${def}}"
         [[ -z "${val}" && -z "${def}" ]] && die "必填项为空, 已取消部署"
         printf -v "${var}" '%s' "${val}"
     else
@@ -175,12 +230,31 @@ ask CODEX_WIRE_API         "  wire_api (responses/chat)"  "${DEFAULT_WIRE_API}" 
   || die "wire_api 仅支持 responses 或 chat, 当前值: ${CODEX_WIRE_API}"
 [[ "${CODEX_BASE_URL}" =~ ^https?:// ]] \
   || die "base_url 必须是 http(s):// 开头的地址, 当前值: $(mask_url "${CODEX_BASE_URL}")"
-[[ "${CODEX_API_KEY}" =~ ^sk- ]] \
-  || warn "API Key 不以 sk- 开头, 请确认是否为有效密钥"
+case "${CODEX_API_KEY}" in
+    *'"'*) die "API Key 不能包含双引号" ;;
+esac
+if [[ "${CODEX_API_KEY}" != sk-* ]]; then
+    if [[ "${INTERACTIVE}" -eq 1 ]]; then
+        # 交互模式: 重新提问, 最多 3 次
+        KEY_ATTEMPT=0
+        while [[ "${CODEX_API_KEY}" != sk-* ]]; do
+            KEY_ATTEMPT=$((KEY_ATTEMPT+1))
+            [[ "${KEY_ATTEMPT}" -ge 3 ]] && die "未能获得有效的 API Key (需以 sk- 开头), 已退出 (未修改任何文件)"
+            warn "API Key 必须以 sk- 开头"
+            read_tty CODEX_API_KEY "  请重新输入 API Key (OPENAI_API_KEY)" 1
+        done
+        case "${CODEX_API_KEY}" in
+            *'"'*) die "API Key 不能包含双引号" ;;
+        esac
+    else
+        die "API Key 必须以 sk- 开头, 当前值: $(mask_key "${CODEX_API_KEY}")"
+    fi
+fi
 
 echo
 info "配置摘要:"
 printf "  目标用户    : %s\n" "${TARGET_USER}"
+printf "  配置目录    : %s\n" "${CODEX_DIR}"
 printf "  API Key     : %s\n" "$(mask_key "${CODEX_API_KEY}")"
 printf "  base_url    : %s\n" "$(mask_url "${CODEX_BASE_URL}")"
 printf "  model       : %s\n" "${CODEX_MODEL}"
@@ -191,7 +265,7 @@ printf "  wire_api    : %s\n" "${CODEX_WIRE_API}"
 echo
 
 if [[ "${INTERACTIVE}" -eq 1 ]]; then
-    read -r -p "确认以上配置并开始部署? [Y/n] " confirm || :
+    read_tty confirm "确认以上配置并开始部署? [Y/n]"
     confirm="${confirm:-Y}"
     [[ "${confirm}" =~ ^[Yy]$ ]] || die "用户取消部署"
 fi
@@ -270,7 +344,6 @@ info "写入配置到 ${CODEX_DIR} ..."
 [[ -d "${CODEX_DIR}" ]] || install -d -m 700 "${CODEX_DIR}"
 
 # 备份已有配置 (保留最近 ${KEEP_BACKUPS} 份)
-KEEP_BACKUPS=5
 if [[ -f "${CODEX_DIR}/config.toml" || -f "${CODEX_DIR}/auth.json" ]]; then
     backup_dir="${CODEX_DIR}.bak.$(date +%Y%m%d%H%M%S)"
     mkdir -p "${backup_dir}"
@@ -283,9 +356,11 @@ if [[ -f "${CODEX_DIR}/config.toml" || -f "${CODEX_DIR}/auth.json" ]]; then
     done < <(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null | tail -n "+$((KEEP_BACKUPS+1))")
 fi
 
-# 以 600 权限直接写入, 避免明文写入窗口
+# 生成配置到临时文件 (600 权限), 校验通过后再原子替换, 失败不影响原文件
+TMP_CONFIG="${CODEX_DIR}/config.toml.tmp.$$"
+TMP_AUTH="${CODEX_DIR}/auth.json.tmp.$$"
 ( umask 077
-cat > "${CODEX_DIR}/config.toml" <<EOF
+cat > "${TMP_CONFIG}" <<EOF
 model_provider = "OpenAI"
 model = "$(escape_string "${CODEX_MODEL}")"
 review_model = "$(escape_string "${CODEX_REVIEW_MODEL}")"
@@ -303,12 +378,52 @@ requires_openai_auth = true
 goals = true
 EOF
 
-cat > "${CODEX_DIR}/auth.json" <<EOF
+cat > "${TMP_AUTH}" <<EOF
 {
   "OPENAI_API_KEY": "$(escape_string "${CODEX_API_KEY}")"
 }
 EOF
 )
+
+# 严格校验 (python3): TOML 用 tomllib (3.11+), JSON 用 json
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 - "${TMP_CONFIG}" "${TMP_AUTH}" <<'PYVAL' 2>/dev/null
+import sys, json
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+errors = []
+if tomllib is not None:
+    try:
+        with open(sys.argv[1], 'rb') as f:
+            c = tomllib.load(f)
+        assert c.get('model') and c.get('model_provider'), 'model/model_provider missing'
+        assert 'OpenAI' in c.get('model_providers', {}), 'model_providers.OpenAI missing'
+    except Exception as e:
+        errors.append('config.toml: %s' % e)
+try:
+    with open(sys.argv[2], 'r', encoding='utf-8') as f:
+        d = json.load(f)
+    assert isinstance(d.get('OPENAI_API_KEY'), str) and d['OPENAI_API_KEY'], 'auth.json 缺少 OPENAI_API_KEY'
+except Exception as e:
+    errors.append('auth.json: %s' % e)
+if errors:
+    print('\n'.join(errors), file=sys.stderr)
+    sys.exit(1)
+PYVAL
+    then
+        ok "配置校验通过 (TOML/JSON)"
+    else
+        rm -f "${TMP_CONFIG}" "${TMP_AUTH}"
+        die "生成的配置未通过校验, 已中止 (原文件未被修改)"
+    fi
+else
+    warn "未找到 python3, 跳过配置严格校验"
+fi
+
+mv "${TMP_CONFIG}" "${CODEX_DIR}/config.toml" || { rm -f "${TMP_CONFIG}" "${TMP_AUTH}"; die "写入 config.toml 失败"; }
+mv "${TMP_AUTH}" "${CODEX_DIR}/auth.json"     || { rm -f "${TMP_AUTH}"; die "写入 auth.json 失败"; }
 
 # ============== 5. 修正属主与权限 ==============
 chown -R "${TARGET_USER}:${TARGET_USER}" "${CODEX_DIR}"
@@ -344,4 +459,7 @@ echo "  切换到该用户后直接运行:  codex"
 if [[ "${TARGET_USER}" != "$(id -un)" ]]; then
     echo "  例如: sudo -iu ${TARGET_USER} codex"
 fi
+echo "  恢复备份 : ${INSTALL_CMD} --restore"
 echo "=================================="
+
+}

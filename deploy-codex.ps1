@@ -12,9 +12,10 @@ param(
     [switch]$NonInteractive
 )
 
-$ErrorActionPreference = 'Stop'
-$exitCode = 0
-$CODEX_API_KEY = $null
+# 该脚本支持 irm <url> | iex。禁止在中止时直接 exit，以免关闭调用者的终端。
+$script:ABORT_SENTINEL = '__DEPLOY_CODEX_ABORT__'
+$script:SCRIPT_URL = 'https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.ps1'
+$script:INSTALL_CMD = "irm $($script:SCRIPT_URL) | iex"
 
 function Write-Info {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -38,12 +39,17 @@ function Write-Fail {
 
 function Stop-Deployment {
     param([Parameter(Mandatory = $true)][string]$Message)
-    throw [System.InvalidOperationException]::new($Message)
+
+    Write-Fail $Message
+    throw $script:ABORT_SENTINEL
 }
 
 function Show-Usage {
-    Write-Host @'
-用法: powershell -ExecutionPolicy Bypass -File deploy-codex.ps1 [选项]
+    Write-Host @"
+一行命令安装并配置 (终端内可交互提问):
+  $($script:INSTALL_CMD)
+  或加环境变量完全非交互 (适合 CI):
+  `$env:CODEX_API_KEY='sk-xxxx'; `$env:CODEX_BASE_URL='https://your.proxy'; $($script:INSTALL_CMD)
 
 选项:
   -h, -Help          显示本帮助
@@ -56,8 +62,9 @@ function Show-Usage {
   CODEX_REVIEW_MODEL     审查模型, 默认 gpt-5.5
   CODEX_REASONING_EFFORT 推理强度, 默认 xhigh
   CODEX_WIRE_API         responses / chat, 默认 responses
+  CODEX_HOME             Codex 配置目录, 默认 %USERPROFILE%\.codex
   NPM_REGISTRY           npm 镜像源, 如 https://registry.npmmirror.com
-'@
+"@
 }
 
 function ConvertFrom-SecureInput {
@@ -72,6 +79,32 @@ function ConvertFrom-SecureInput {
         if ($bstr -ne [IntPtr]::Zero) {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
+    }
+}
+
+function Read-DeploymentInput {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prompt,
+        [switch]$Secret
+    )
+
+    try {
+        if ($Secret) {
+            $secureValue = Read-Host $Prompt -AsSecureString
+            try {
+                return ConvertFrom-SecureInput -SecureValue $secureValue
+            }
+            finally {
+                if ($null -ne $secureValue) {
+                    $secureValue.Dispose()
+                }
+            }
+        }
+
+        return Read-Host $Prompt
+    }
+    catch {
+        Stop-Deployment '无法读取输入 (非交互环境), 已取消部署, 未修改任何文件'
     }
 }
 
@@ -95,20 +128,9 @@ function Get-DeploymentParameter {
             $hint = " [默认: $DefaultValue]"
         }
 
-        if ($Secret) {
-            $secureValue = Read-Host "$Message$hint (输入不回显)" -AsSecureString
-            try {
-                $value = ConvertFrom-SecureInput -SecureValue $secureValue
-            }
-            finally {
-                $secureValue.Dispose()
-            }
-        }
-        else {
-            $value = Read-Host "$Message$hint"
-            if ([string]::IsNullOrEmpty($value)) {
-                $value = $DefaultValue
-            }
+        $value = Read-DeploymentInput -Prompt "$Message$hint$(if ($Secret) { ' (输入不回显)' } else { '' })" -Secret:$Secret
+        if (-not $Secret -and [string]::IsNullOrEmpty($value)) {
+            $value = $DefaultValue
         }
 
         if ([string]::IsNullOrEmpty($value) -and [string]::IsNullOrEmpty($DefaultValue)) {
@@ -121,6 +143,38 @@ function Get-DeploymentParameter {
         Stop-Deployment "非交互模式且未设置环境变量 $Name, 请用 `$env:${Name}='...' 后运行 deploy-codex.ps1"
     }
     return $DefaultValue
+}
+
+function Confirm-ApiKey {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiKey,
+        [Parameter(Mandatory = $true)][bool]$IsInteractive
+    )
+
+    $validatedKey = $ApiKey
+    $attempt = 0
+    while ($validatedKey -cnotmatch '^sk-') {
+        $attempt++
+        Write-Warn 'API Key 必须以 sk- 开头'
+
+        if (-not $IsInteractive) {
+            Stop-Deployment '非交互模式下 API Key 不以 sk- 开头, 已取消部署, 未修改任何文件'
+        }
+        if ($attempt -ge 3) {
+            Stop-Deployment '连续 3 次未获得有效 API Key (必须以 sk- 开头), 已取消部署, 未修改任何文件'
+        }
+
+        $validatedKey = Read-DeploymentInput -Prompt '  请重新输入 API Key (输入不回显)' -Secret
+        if ($validatedKey -cmatch '"') {
+            Stop-Deployment 'API Key 不能包含双引号, 已取消部署, 未修改任何文件'
+        }
+    }
+
+    if ($validatedKey -cmatch '"') {
+        Stop-Deployment 'API Key 不能包含双引号, 已取消部署, 未修改任何文件'
+    }
+
+    return $validatedKey
 }
 
 function Get-MaskedKey {
@@ -152,7 +206,7 @@ function Write-Utf8NoBomFile {
     )
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($Path, $Content, $encoding)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
 function Protect-FileForCurrentUser {
@@ -169,7 +223,7 @@ function Protect-FileForCurrentUser {
         [void]$acl.RemoveAccessRuleAll($rule)
     }
 
-    $currentUserRule = [Security.AccessControl.FileSystemAccessRule]::new(
+    $currentUserRule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
         $identity.User,
         [Security.AccessControl.FileSystemRights]::FullControl,
         [Security.AccessControl.AccessControlType]::Allow
@@ -215,7 +269,7 @@ function Install-NodeIfNeeded {
 
     $wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
     if ($null -eq $wingetCommand) {
-        Stop-Deployment '未找到 winget, 请先安装“应用安装程序”(App Installer), 或手动安装 Node.js 20+' 
+        Stop-Deployment '未找到 winget, 请先安装“应用安装程序”(App Installer), 或手动安装 Node.js 20+'
     }
 
     & $wingetCommand.Source install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements
@@ -236,249 +290,334 @@ function Install-NodeIfNeeded {
     }
 }
 
-try {
-    if ($Help) {
-        Show-Usage
-        exit 0
-    }
+function Test-GeneratedConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigTempPath,
+        [Parameter(Mandatory = $true)][string]$AuthTempPath
+    )
 
-    $defaultModel = 'gpt-5.5'
-    $defaultReviewModel = 'gpt-5.5'
-    $defaultReasoningEffort = 'xhigh'
-    $defaultWireApi = 'responses'
-
-    if ([string]::IsNullOrEmpty($env:USERPROFILE)) {
-        Stop-Deployment '未找到 USERPROFILE, 无法确定当前用户的家目录'
-    }
-
-    $targetIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if ($null -ne $targetIdentity -and -not [string]::IsNullOrEmpty($targetIdentity.Name)) {
-        $targetUser = $targetIdentity.Name
-    }
-    elseif (-not [string]::IsNullOrEmpty($env:USERNAME)) {
-        $targetUser = $env:USERNAME
-    }
-    else {
-        Stop-Deployment '无法确定当前 Windows 用户'
-    }
-
-    $codexDir = Join-Path $env:USERPROFILE '.codex'
-    $configPath = Join-Path $codexDir 'config.toml'
-    $authPath = Join-Path $codexDir 'auth.json'
-
-    $stdinIsRedirected = $true
     try {
-        $stdinIsRedirected = [Console]::IsInputRedirected
+        $authRaw = Get-Content -LiteralPath $AuthTempPath -Raw -Encoding UTF8
+        $parsedAuth = $authRaw | ConvertFrom-Json
+        if ($null -eq $parsedAuth) {
+            throw 'auth.json 解析结果为空'
+        }
+
+        $apiKeyProperty = $parsedAuth.PSObject.Properties['OPENAI_API_KEY']
+        if ($null -eq $apiKeyProperty -or -not ($apiKeyProperty.Value -is [string]) -or [string]::IsNullOrEmpty($apiKeyProperty.Value)) {
+            throw 'auth.json 缺少非空字符串 OPENAI_API_KEY'
+        }
+
+        $configRaw = Get-Content -LiteralPath $ConfigTempPath -Raw -Encoding UTF8
+        $requiredPatterns = @(
+            '(?m)^model_provider\s*=\s*"OpenAI"\s*$',
+            '(?m)^model\s*=\s*".+"\s*$',
+            '(?m)^network_access\s*=\s*"enabled"\s*$',
+            '(?m)^\[model_providers\.OpenAI\]\s*$'
+        )
+        foreach ($pattern in $requiredPatterns) {
+            if ($configRaw -cnotmatch $pattern) {
+                throw "config.toml 缺少预期配置项: $pattern"
+            }
+        }
     }
     catch {
-        $stdinIsRedirected = $true
+        Remove-Item -LiteralPath $ConfigTempPath, $AuthTempPath -Force -ErrorAction SilentlyContinue
+        Stop-Deployment "生成的配置校验失败, 原文件未被修改: $($_.Exception.Message)"
     }
-    $hostWasStartedNonInteractive = [Environment]::CommandLine -match '(?i)(?:^|\s)-(?:NonInteractive|noni)(?:\s|$)'
-    $isInteractive = (-not $stdinIsRedirected) -and (-not $NonInteractive) -and (-not $hostWasStartedNonInteractive)
-
-    Write-Host
-    Write-Info '=========== Codex 配置参数 ==========='
-    $CODEX_API_KEY = Get-DeploymentParameter -Name 'CODEX_API_KEY' -Message '  API Key (OPENAI_API_KEY)' -Secret -IsInteractive $isInteractive
-    $CODEX_BASE_URL = Get-DeploymentParameter -Name 'CODEX_BASE_URL' -Message '  代理地址 (base_url)' -IsInteractive $isInteractive
-    $CODEX_MODEL = Get-DeploymentParameter -Name 'CODEX_MODEL' -Message '  模型 (model)' -DefaultValue $defaultModel -IsInteractive $isInteractive
-    $CODEX_REVIEW_MODEL = Get-DeploymentParameter -Name 'CODEX_REVIEW_MODEL' -Message '  审查模型 (review_model)' -DefaultValue $defaultReviewModel -IsInteractive $isInteractive
-    $CODEX_REASONING_EFFORT = Get-DeploymentParameter -Name 'CODEX_REASONING_EFFORT' -Message '  推理强度 (reasoning_effort)' -DefaultValue $defaultReasoningEffort -IsInteractive $isInteractive
-    $CODEX_WIRE_API = Get-DeploymentParameter -Name 'CODEX_WIRE_API' -Message '  wire_api (responses/chat)' -DefaultValue $defaultWireApi -IsInteractive $isInteractive
-    $NPM_REGISTRY = [Environment]::GetEnvironmentVariable('NPM_REGISTRY', 'Process')
-    if ($null -eq $NPM_REGISTRY) {
-        $NPM_REGISTRY = ''
-    }
-
-    if ($CODEX_WIRE_API -cnotmatch '^(responses|chat)$') {
-        Stop-Deployment "wire_api 仅支持 responses 或 chat, 当前值: $CODEX_WIRE_API"
-    }
-    if ($CODEX_BASE_URL -cnotmatch '^https?://') {
-        Stop-Deployment "base_url 必须是 http(s):// 开头的地址, 当前值: $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
-    }
-    if ($CODEX_API_KEY -cnotmatch '^sk-') {
-        Write-Warn 'API Key 不以 sk- 开头, 请确认是否为有效密钥'
-    }
-
-    Write-Host
-    Write-Info '配置摘要:'
-    Write-Host "  目标用户    : $targetUser"
-    Write-Host "  API Key     : $(Get-MaskedKey -Key $CODEX_API_KEY)"
-    Write-Host "  base_url    : $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
-    Write-Host "  model       : $CODEX_MODEL"
-    Write-Host "  review_model: $CODEX_REVIEW_MODEL"
-    Write-Host "  effort      : $CODEX_REASONING_EFFORT"
-    Write-Host "  wire_api    : $CODEX_WIRE_API"
-    if (-not [string]::IsNullOrEmpty($NPM_REGISTRY)) {
-        Write-Host "  npm 镜像    : $NPM_REGISTRY"
-    }
-    Write-Host
-
-    if ($isInteractive) {
-        $confirmation = Read-Host '确认以上配置并开始部署? [Y/n]'
-        if ([string]::IsNullOrEmpty($confirmation)) {
-            $confirmation = 'Y'
-        }
-        if ($confirmation -cnotmatch '^[Yy]$') {
-            Stop-Deployment '用户取消部署'
-        }
-    }
-
-    Install-NodeIfNeeded
-
-    $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
-    if ($null -eq $npmCommand) {
-        Stop-Deployment '未找到 npm, 请先安装 npm 或重新安装 Node.js'
-    }
-
-    Write-Info '通过 npm 全局安装 @openai/codex ...'
-    $npmArguments = @('install', '-g', '--no-audit', '--no-fund', '@openai/codex')
-    if (-not [string]::IsNullOrEmpty($NPM_REGISTRY)) {
-        $npmArguments += "--registry=$NPM_REGISTRY"
-    }
-
-    $savedErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $npmOutput = @(& $npmCommand.Source @npmArguments 2>&1)
-        $npmExitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $savedErrorActionPreference
-    }
-    if ($npmExitCode -ne 0) {
-        foreach ($outputLine in $npmOutput) {
-            Write-Host ([string]$outputLine) -ForegroundColor Red
-        }
-        Stop-Deployment 'npm 安装 codex 失败, 请检查网络/镜像源 (国内网络可设置 NPM_REGISTRY=https://registry.npmmirror.com)'
-    }
-
-    $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
-    if ($null -eq $codexCommand) {
-        Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
-    }
-    $codexVersion = (& $codexCommand.Source --version 2>$null | Out-String).Trim()
-    if ([string]::IsNullOrEmpty($codexVersion)) {
-        $codexVersion = 'installed'
-    }
-    Write-Ok "Codex 安装完成: $codexVersion"
-
-    Write-Info "写入配置到 $codexDir ..."
-    if (-not (Test-Path -LiteralPath $codexDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $codexDir -Force | Out-Null
-    }
-
-    if ((Test-Path -LiteralPath $configPath -PathType Leaf) -or (Test-Path -LiteralPath $authPath -PathType Leaf)) {
-        $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
-        $backupDir = "$codexDir.bak.$timestamp"
-        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-            Copy-Item -LiteralPath $configPath -Destination $backupDir -Force
-            Protect-FileForCurrentUser -Path (Join-Path $backupDir 'config.toml')
-        }
-        if (Test-Path -LiteralPath $authPath -PathType Leaf) {
-            Copy-Item -LiteralPath $authPath -Destination $backupDir -Force
-            Protect-FileForCurrentUser -Path (Join-Path $backupDir 'auth.json')
-        }
-        Write-Ok "已备份旧配置到 $backupDir"
-
-        $backupParent = Split-Path -Parent $codexDir
-        $backupPrefix = (Split-Path -Leaf $codexDir) + '.bak.*'
-        $oldBackups = @(Get-ChildItem -LiteralPath $backupParent -Directory | Where-Object { $_.Name -like $backupPrefix } | Sort-Object Name -Descending | Select-Object -Skip 5)
-        foreach ($oldBackup in $oldBackups) {
-            Remove-Item -LiteralPath $oldBackup.FullName -Recurse -Force
-        }
-    }
-
-    $escapedModel = ConvertTo-ConfigString -Value $CODEX_MODEL
-    $escapedReviewModel = ConvertTo-ConfigString -Value $CODEX_REVIEW_MODEL
-    $escapedReasoningEffort = ConvertTo-ConfigString -Value $CODEX_REASONING_EFFORT
-    $escapedBaseUrl = ConvertTo-ConfigString -Value $CODEX_BASE_URL
-    $escapedWireApi = ConvertTo-ConfigString -Value $CODEX_WIRE_API
-    $escapedApiKey = ConvertTo-ConfigString -Value $CODEX_API_KEY
-
-    $configContent = @"
-model_provider = "OpenAI"
-model = "$escapedModel"
-review_model = "$escapedReviewModel"
-model_reasoning_effort = "$escapedReasoningEffort"
-disable_response_storage = true
-network_access = "enabled"
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = "$escapedBaseUrl"
-wire_api = "$escapedWireApi"
-requires_openai_auth = true
-
-[features]
-goals = true
-"@
-    $authContent = @"
-{
-  "OPENAI_API_KEY": "$escapedApiKey"
 }
-"@
 
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-        Write-Utf8NoBomFile -Path $configPath -Content ''
-    }
-    if (-not (Test-Path -LiteralPath $authPath -PathType Leaf)) {
-        Write-Utf8NoBomFile -Path $authPath -Content ''
-    }
-    Protect-FileForCurrentUser -Path $configPath
-    Protect-FileForCurrentUser -Path $authPath
-    Write-Utf8NoBomFile -Path $configPath -Content $configContent
-    Write-Utf8NoBomFile -Path $authPath -Content $authContent
-    Protect-FileForCurrentUser -Path $configPath
-    Protect-FileForCurrentUser -Path $authPath
-    Write-Ok '权限设置完成'
+function Write-CodexConfigurationAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$AuthPath,
+        [Parameter(Mandatory = $true)][string]$ConfigContent,
+        [Parameter(Mandatory = $true)][string]$AuthContent
+    )
 
-    Write-Info '配置预览(auth.json, 密钥已打码):'
-    Write-Host '{'
-    Write-Host "  `"OPENAI_API_KEY`": `"$(Get-MaskedKey -Key $CODEX_API_KEY)`""
-    Write-Host '}'
+    $configTempPath = "$ConfigPath.tmp"
+    $authTempPath = "$AuthPath.tmp"
+    Remove-Item -LiteralPath $configTempPath, $authTempPath -Force -ErrorAction SilentlyContinue
 
+    $configCommitted = $false
     try {
-        Invoke-WebRequest -Uri $CODEX_BASE_URL -Method Get -UseBasicParsing -TimeoutSec 8 | Out-Null
-        Write-Ok "代理地址可达: $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        Write-Utf8NoBomFile -Path $configTempPath -Content $ConfigContent
+        Write-Utf8NoBomFile -Path $authTempPath -Content $AuthContent
+        Protect-FileForCurrentUser -Path $configTempPath
+        Protect-FileForCurrentUser -Path $authTempPath
+        Test-GeneratedConfiguration -ConfigTempPath $configTempPath -AuthTempPath $authTempPath
+
+        Move-Item -LiteralPath $configTempPath -Destination $ConfigPath -Force
+        $configCommitted = $true
+        Move-Item -LiteralPath $authTempPath -Destination $AuthPath -Force
     }
     catch {
-        Write-Warn "代理地址探测无响应(可能是正常的): $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        Remove-Item -LiteralPath $configTempPath, $authTempPath -Force -ErrorAction SilentlyContinue
+        if ($_.Exception.Message -eq $script:ABORT_SENTINEL) {
+            throw
+        }
+        if ($configCommitted) {
+            Stop-Deployment "写入 auth.json 失败；config.toml 已替换，请从最新备份恢复: $($_.Exception.Message)"
+        }
+        Stop-Deployment "写入配置失败, 原文件未被修改: $($_.Exception.Message)"
     }
 
-    $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
-    if ($null -eq $codexCommand) {
-        Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
-    }
-    $codexPath = $codexCommand.Source
+    Protect-FileForCurrentUser -Path $ConfigPath
+    Protect-FileForCurrentUser -Path $AuthPath
+}
 
-    Write-Host
-    Write-Ok '============ 部署完成 ============'
-    Write-Host "  用户 : $targetUser"
-    Write-Host "  命令 : $codexPath"
-    Write-Host "  配置 : $configPath"
-    Write-Host "  密钥 : $authPath"
-    Write-Host
-    Write-Host '  直接运行:  codex'
-    Write-Host '=================================='
-}
-catch {
-    $exitCode = 1
-    Write-Fail $_.Exception.Message
-}
-finally {
+function Invoke-DeployCodexMain {
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version Latest
+
     $CODEX_API_KEY = $null
     $escapedApiKey = $null
     $authContent = $null
+
+    try {
+        if ($Help) {
+            Show-Usage
+            return
+        }
+
+        $defaultModel = 'gpt-5.5'
+        $defaultReviewModel = 'gpt-5.5'
+        $defaultReasoningEffort = 'xhigh'
+        $defaultWireApi = 'responses'
+
+        if ([string]::IsNullOrEmpty($env:CODEX_HOME) -and [string]::IsNullOrEmpty($env:USERPROFILE)) {
+            Stop-Deployment '未找到 USERPROFILE, 无法确定当前用户的家目录'
+        }
+
+        $targetIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -ne $targetIdentity -and -not [string]::IsNullOrEmpty($targetIdentity.Name)) {
+            $targetUser = $targetIdentity.Name
+        }
+        elseif (-not [string]::IsNullOrEmpty($env:USERNAME)) {
+            $targetUser = $env:USERNAME
+        }
+        else {
+            Stop-Deployment '无法确定当前 Windows 用户'
+        }
+
+        $codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+        $configPath = Join-Path $codexDir 'config.toml'
+        $authPath = Join-Path $codexDir 'auth.json'
+
+        $hostWasStartedNonInteractive = [Environment]::CommandLine -match '(?i)(?:^|\s)-(?:NonInteractive|NonI)(?:\s|$)'
+        $isInteractive = (-not $NonInteractive) -and (-not $hostWasStartedNonInteractive)
+
+        Write-Host
+        Write-Info '=========== Codex 配置参数 ==========='
+        $CODEX_API_KEY = Get-DeploymentParameter -Name 'CODEX_API_KEY' -Message '  API Key (OPENAI_API_KEY)' -Secret -IsInteractive $isInteractive
+        $CODEX_BASE_URL = Get-DeploymentParameter -Name 'CODEX_BASE_URL' -Message '  代理地址 (base_url)' -IsInteractive $isInteractive
+        $CODEX_MODEL = Get-DeploymentParameter -Name 'CODEX_MODEL' -Message '  模型 (model)' -DefaultValue $defaultModel -IsInteractive $isInteractive
+        $CODEX_REVIEW_MODEL = Get-DeploymentParameter -Name 'CODEX_REVIEW_MODEL' -Message '  审查模型 (review_model)' -DefaultValue $defaultReviewModel -IsInteractive $isInteractive
+        $CODEX_REASONING_EFFORT = Get-DeploymentParameter -Name 'CODEX_REASONING_EFFORT' -Message '  推理强度 (reasoning_effort)' -DefaultValue $defaultReasoningEffort -IsInteractive $isInteractive
+        $CODEX_WIRE_API = Get-DeploymentParameter -Name 'CODEX_WIRE_API' -Message '  wire_api (responses/chat)' -DefaultValue $defaultWireApi -IsInteractive $isInteractive
+        $NPM_REGISTRY = [Environment]::GetEnvironmentVariable('NPM_REGISTRY', 'Process')
+        if ($null -eq $NPM_REGISTRY) {
+            $NPM_REGISTRY = ''
+        }
+
+        $CODEX_API_KEY = Confirm-ApiKey -ApiKey $CODEX_API_KEY -IsInteractive $isInteractive
+        if ($CODEX_WIRE_API -cnotmatch '^(responses|chat)$') {
+            Stop-Deployment "wire_api 仅支持 responses 或 chat, 当前值: $CODEX_WIRE_API"
+        }
+        if ($CODEX_BASE_URL -cnotmatch '^https?://') {
+            Stop-Deployment "base_url 必须是 http(s):// 开头的地址, 当前值: $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        }
+
+        Write-Host
+        Write-Info '配置摘要:'
+        Write-Host "  目标用户    : $targetUser"
+        Write-Host "  API Key     : $(Get-MaskedKey -Key $CODEX_API_KEY)"
+        Write-Host "  base_url    : $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        Write-Host "  model       : $CODEX_MODEL"
+        Write-Host "  review_model: $CODEX_REVIEW_MODEL"
+        Write-Host "  effort      : $CODEX_REASONING_EFFORT"
+        Write-Host "  wire_api    : $CODEX_WIRE_API"
+        if (-not [string]::IsNullOrEmpty($NPM_REGISTRY)) {
+            Write-Host "  npm 镜像    : $NPM_REGISTRY"
+        }
+        Write-Host
+
+        if ($isInteractive) {
+            $confirmation = Read-DeploymentInput -Prompt '确认以上配置并开始部署? [Y/n]'
+            if ([string]::IsNullOrEmpty($confirmation)) {
+                $confirmation = 'Y'
+            }
+            if ($confirmation -cnotmatch '^[Yy]$') {
+                Stop-Deployment '用户取消部署'
+            }
+        }
+
+        Install-NodeIfNeeded
+
+        $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
+        if ($null -eq $npmCommand) {
+            Stop-Deployment '未找到 npm, 请先安装 npm 或重新安装 Node.js'
+        }
+
+        Write-Info '通过 npm 全局安装 @openai/codex ...'
+        $npmArguments = @('install', '-g', '--no-audit', '--no-fund', '@openai/codex')
+        if (-not [string]::IsNullOrEmpty($NPM_REGISTRY)) {
+            $npmArguments += "--registry=$NPM_REGISTRY"
+        }
+
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $npmOutput = @(& $npmCommand.Source @npmArguments 2>&1)
+            $npmExitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        if ($npmExitCode -ne 0) {
+            foreach ($outputLine in $npmOutput) {
+                Write-Host ([string]$outputLine) -ForegroundColor Red
+            }
+            Stop-Deployment 'npm 安装 codex 失败, 请检查网络/镜像源 (国内网络可设置 NPM_REGISTRY=https://registry.npmmirror.com)'
+        }
+
+        $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
+        if ($null -eq $codexCommand) {
+            Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
+        }
+        $codexVersion = (& $codexCommand.Source --version 2>$null | Out-String).Trim()
+        if ([string]::IsNullOrEmpty($codexVersion)) {
+            $codexVersion = 'installed'
+        }
+        Write-Ok "Codex 安装完成: $codexVersion"
+
+        Write-Info "写入配置到 $codexDir ..."
+        if (-not (Test-Path -LiteralPath $codexDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $codexDir -Force | Out-Null
+        }
+
+        if ((Test-Path -LiteralPath $configPath -PathType Leaf) -or (Test-Path -LiteralPath $authPath -PathType Leaf)) {
+            $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+            $backupDir = "$codexDir.bak.$timestamp"
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+            if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                Copy-Item -LiteralPath $configPath -Destination $backupDir -Force
+                Protect-FileForCurrentUser -Path (Join-Path $backupDir 'config.toml')
+            }
+            if (Test-Path -LiteralPath $authPath -PathType Leaf) {
+                Copy-Item -LiteralPath $authPath -Destination $backupDir -Force
+                Protect-FileForCurrentUser -Path (Join-Path $backupDir 'auth.json')
+            }
+            Write-Ok "已备份旧配置到 $backupDir"
+
+            $backupParent = Split-Path -Parent $codexDir
+            if ([string]::IsNullOrEmpty($backupParent)) {
+                $backupParent = '.'
+            }
+            $backupPrefix = (Split-Path -Leaf $codexDir) + '.bak.*'
+            $oldBackups = @(Get-ChildItem -LiteralPath $backupParent -Directory | Where-Object { $_.Name -like $backupPrefix } | Sort-Object Name -Descending | Select-Object -Skip 5)
+            foreach ($oldBackup in $oldBackups) {
+                Remove-Item -LiteralPath $oldBackup.FullName -Recurse -Force
+            }
+        }
+
+        $escapedModel = ConvertTo-ConfigString -Value $CODEX_MODEL
+        $escapedReviewModel = ConvertTo-ConfigString -Value $CODEX_REVIEW_MODEL
+        $escapedReasoningEffort = ConvertTo-ConfigString -Value $CODEX_REASONING_EFFORT
+        $escapedBaseUrl = ConvertTo-ConfigString -Value $CODEX_BASE_URL
+        $escapedWireApi = ConvertTo-ConfigString -Value $CODEX_WIRE_API
+        $escapedApiKey = ConvertTo-ConfigString -Value $CODEX_API_KEY
+
+        $configContent = @(
+            'model_provider = "OpenAI"',
+            "model = `"$escapedModel`"",
+            "review_model = `"$escapedReviewModel`"",
+            "model_reasoning_effort = `"$escapedReasoningEffort`"",
+            'disable_response_storage = true',
+            'network_access = "enabled"',
+            '',
+            '[model_providers.OpenAI]',
+            'name = "OpenAI"',
+            "base_url = `"$escapedBaseUrl`"",
+            "wire_api = `"$escapedWireApi`"",
+            'requires_openai_auth = true',
+            '',
+            '[features]',
+            'goals = true'
+        ) -join "`n"
+        $configContent += "`n"
+
+        $authContent = @(
+            '{',
+            "  `"OPENAI_API_KEY`": `"$escapedApiKey`"",
+            '}'
+        ) -join "`n"
+        $authContent += "`n"
+
+        Write-CodexConfigurationAtomically -ConfigPath $configPath -AuthPath $authPath -ConfigContent $configContent -AuthContent $authContent
+        Write-Ok '权限设置完成'
+
+        Write-Info '配置预览(auth.json, 密钥已打码):'
+        Write-Host '{'
+        Write-Host "  `"OPENAI_API_KEY`": `"$(Get-MaskedKey -Key $CODEX_API_KEY)`""
+        Write-Host '}'
+
+        try {
+            Invoke-WebRequest -Uri $CODEX_BASE_URL -Method Get -UseBasicParsing -TimeoutSec 8 | Out-Null
+            Write-Ok "代理地址可达: $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        }
+        catch {
+            Write-Warn "代理地址探测无响应(可能是正常的): $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
+        }
+
+        $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
+        if ($null -eq $codexCommand) {
+            Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
+        }
+        $codexPath = $codexCommand.Source
+
+        Write-Host
+        Write-Ok '============ 部署完成 ============'
+        Write-Host "  用户 : $targetUser"
+        Write-Host "  命令 : $codexPath"
+        Write-Host "  配置 : $configPath"
+        Write-Host "  密钥 : $authPath"
+        Write-Host
+        Write-Host '  直接运行:  codex'
+        Write-Host '=================================='
+    }
+    finally {
+        $CODEX_API_KEY = $null
+        $escapedApiKey = $null
+        $authContent = $null
+    }
 }
 
-exit $exitCode
+# 入口调度器: 文件执行时返回退出码；irm | iex 时只返回，不关闭调用者终端。
+try {
+    Invoke-DeployCodexMain
+    if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
+        exit 0
+    }
+    return
+}
+catch {
+    if ($_.Exception.Message -ne $script:ABORT_SENTINEL) {
+        throw
+    }
+    if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
+        exit 1
+    }
+    return
+}
 
 <#
-运行方式:
-  1. 交互式:
-     powershell -ExecutionPolicy Bypass -File deploy-codex.ps1
+运行方式 (一行命令, 终端内可交互提问):
+  irm https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.ps1 | iex
 
-  2. 非交互式（环境变量 + 管道）:
-     $env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"; "" | powershell -NonInteractive -ExecutionPolicy Bypass -File deploy-codex.ps1
+或下载后运行:
+  powershell -ExecutionPolicy Bypass -File deploy-codex.ps1
+
+非交互式 (环境变量 + -NonInteractive):
+  $env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"; powershell -NonInteractive -ExecutionPolicy Bypass -File deploy-codex.ps1
 #>
