@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Codex CLI 一次性部署脚本（Debian 12）
+# Codex CLI 一键部署脚本（Debian 12 / Ubuntu / macOS）
 #
 # 用法:
 #   1) 交互式(推荐):  sudo bash deploy-codex.sh
@@ -13,8 +13,11 @@
 #
 #   3) 远程一键:
 #        curl -fsSL http://your-host/deploy-codex.sh \
-#          | sudo CODEX_API_KEY="sk-xxxx" bash
+#          | sudo CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" bash
 #
+# 平台支持:
+#   - Linux (Debian 12 / Ubuntu): apt-get + NodeSource
+#   - macOS (Darwin):             Homebrew (需先安装好 brew)
 set -euo pipefail
 
 # ============== 默认值(交互时作为回车默认项) ==============
@@ -23,7 +26,9 @@ DEFAULT_MODEL="gpt-5.5"
 DEFAULT_REVIEW_MODEL="gpt-5.5"
 DEFAULT_REASONING_EFFORT="xhigh"
 DEFAULT_WIRE_API="responses"
-NODE_MAJOR="${NODE_MAJOR:-20}"
+NODE_MAJOR="${NODE_MAJOR:-22}"        # Node 主版本 (Node 20 已于 2026-04 EOL, 默认装 22 LTS)
+NODE_MIN_MAJOR=20                     # 已安装 Node 大版本 >= 该值则跳过安装
+NPM_REGISTRY="${NPM_REGISTRY:-}"      # 可选 npm 镜像源, 如 https://registry.npmmirror.com
 
 # ============== 颜色输出 ==============
 if [[ -t 1 ]]; then
@@ -37,11 +42,52 @@ ok()    { printf "${C_GREEN}[ OK ]${C_NC} %s\n"  "$*"; }
 warn()  { printf "${C_YELLOW}[WARN]${C_NC} %s\n" "$*"; }
 die()   { printf "${C_RED}[FAIL]${C_NC} %s\n" "$*" >&2; exit 1; }
 
+# ============== 帮助 ==============
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+用法: sudo bash deploy-codex.sh [选项]
+
+选项:
+  -h, --help   显示本帮助
+
+参数通过环境变量传入(优先级: 环境变量 > 交互输入 > 默认值):
+  CODEX_API_KEY          必填, API Key
+  CODEX_BASE_URL         必填, API 代理地址
+  CODEX_MODEL            模型名, 默认 gpt-5.5
+  CODEX_REVIEW_MODEL     审查模型, 默认 gpt-5.5
+  CODEX_REASONING_EFFORT 推理强度, 默认 xhigh
+  CODEX_WIRE_API         responses / chat, 默认 responses
+  NODE_MAJOR             Node 主版本, 默认 22
+  NPM_REGISTRY           npm 镜像源, 如 https://registry.npmmirror.com
+EOF
+    exit 0
+fi
+
+# ============== 平台检测 ==============
+detect_os() {
+    case "$(uname -s)" in
+        Darwin) OS="macos" ;;
+        Linux)  OS="linux" ;;
+        *)      die "不支持的系统: $(uname -s), 仅支持 Debian/Ubuntu/macOS" ;;
+    esac
+}
+detect_os
+
 # ============== 前置检查 ==============
 [[ $EUID -eq 0 ]] || die "请使用 root 运行: sudo bash $0"
-[[ -f /etc/os-release ]] || die "未找到 /etc/os-release, 该脚本仅支持 Debian/Ubuntu"
-grep -qi debian /etc/os-release 2>/dev/null \
-  || warn "当前系统非 Debian, 脚本按 Debian/Ubuntu 兼容处理, 继续执行..."
+case "${OS}" in
+    linux)
+        [[ -f /etc/os-release ]] || die "未找到 /etc/os-release, 该脚本仅支持 Debian/Ubuntu"
+        grep -qEi 'debian|ubuntu' /etc/os-release \
+          || die "仅支持 Debian/Ubuntu 系统, 当前系统无法识别"
+        command -v apt-get >/dev/null 2>&1 \
+          || die "未找到 apt-get, 仅支持 Debian/Ubuntu 系统"
+        ;;
+    macos)
+        command -v brew >/dev/null 2>&1 \
+          || die "未找到 Homebrew, 请先安装: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        ;;
+esac
 
 # 实际使用 codex 的目标用户(配置写到该用户家目录)
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
@@ -49,7 +95,16 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 else
     TARGET_USER="root"
 fi
-TARGET_HOME=$(getent passwd "${TARGET_USER}" | cut -d: -f6) || die "无法解析用户 ${TARGET_USER} 的家目录"
+# 解析目标用户家目录: Linux 用 getent, macOS 用 id -P (输出 passwd 格式, 第6字段为家目录)
+if command -v getent >/dev/null 2>&1; then
+    TARGET_HOME=$(getent passwd "${TARGET_USER}" | cut -d: -f6) \
+      || die "无法解析用户 ${TARGET_USER} 的家目录"
+elif command -v id >/dev/null 2>&1 && id -P "${TARGET_USER}" >/dev/null 2>&1; then
+    TARGET_HOME=$(id -P "${TARGET_USER}" 2>/dev/null | cut -d: -f6)
+    [[ -n "${TARGET_HOME}" ]] || die "无法解析用户 ${TARGET_USER} 的家目录"
+else
+    die "无法解析用户 ${TARGET_USER} 的家目录"
+fi
 CODEX_DIR="${TARGET_HOME}/.codex"
 
 # ============== 交互式参数读取 ==============
@@ -68,10 +123,10 @@ ask() {
     if [[ "${INTERACTIVE}" -eq 1 ]]; then
         [[ -n "${def}" ]] && hint=" [默认: ${def}]"
         if [[ "${secret}" -eq 1 ]]; then
-            read -r -s -p "${msg}${hint} (输入不回显): " val
+            read -r -s -p "${msg}${hint} (输入不回显): " val || :
             echo
         else
-            read -r -p "${msg}${hint}: " val
+            read -r -p "${msg}${hint}: " val || :
             val="${val:-${def}}"
         fi
         [[ -z "${val}" && -z "${def}" ]] && die "必填项为空, 已取消部署"
@@ -85,6 +140,27 @@ ask() {
 
 mask_key() { printf '%s********\n' "${1:0:8}"; }   # 只显示前8位
 
+# 隐藏 URL 中的凭据: https://user:pass@host -> https://user:***@host
+mask_url() {
+    local u="$1"
+    if [[ "${u}" =~ ^(https?://)([^/@:]+):[^/@]+@(.*)$ ]]; then
+        printf '%s%s:***@%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        printf '%s\n' "${u}"
+    fi
+}
+
+# 转义字符串中的特殊字符 (兼容 TOML 与 JSON 字符串)
+escape_string() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "${s}"
+}
+
 echo
 info "=========== Codex 配置参数 ==========="
 ask CODEX_API_KEY          "  API Key (OPENAI_API_KEY)"   ""                    1
@@ -94,75 +170,133 @@ ask CODEX_REVIEW_MODEL     "  审查模型 (review_model)"    "${DEFAULT_REVIEW_
 ask CODEX_REASONING_EFFORT "  推理强度 (reasoning_effort)" "${DEFAULT_REASONING_EFFORT}" 0
 ask CODEX_WIRE_API         "  wire_api (responses/chat)"  "${DEFAULT_WIRE_API}" 0
 
+# ============== 参数校验 ==============
+[[ "${CODEX_WIRE_API}" =~ ^(responses|chat)$ ]] \
+  || die "wire_api 仅支持 responses 或 chat, 当前值: ${CODEX_WIRE_API}"
+[[ "${CODEX_BASE_URL}" =~ ^https?:// ]] \
+  || die "base_url 必须是 http(s):// 开头的地址, 当前值: $(mask_url "${CODEX_BASE_URL}")"
+[[ "${CODEX_API_KEY}" =~ ^sk- ]] \
+  || warn "API Key 不以 sk- 开头, 请确认是否为有效密钥"
+
 echo
 info "配置摘要:"
 printf "  目标用户    : %s\n" "${TARGET_USER}"
 printf "  API Key     : %s\n" "$(mask_key "${CODEX_API_KEY}")"
-printf "  base_url    : %s\n" "${CODEX_BASE_URL}"
+printf "  base_url    : %s\n" "$(mask_url "${CODEX_BASE_URL}")"
 printf "  model       : %s\n" "${CODEX_MODEL}"
 printf "  review_model: %s\n" "${CODEX_REVIEW_MODEL}"
 printf "  effort      : %s\n" "${CODEX_REASONING_EFFORT}"
 printf "  wire_api    : %s\n" "${CODEX_WIRE_API}"
+[[ -n "${NPM_REGISTRY}" ]] && printf "  npm 镜像    : %s\n" "${NPM_REGISTRY}"
 echo
 
 if [[ "${INTERACTIVE}" -eq 1 ]]; then
-    read -r -p "确认以上配置并开始部署? [Y/n] " confirm
+    read -r -p "确认以上配置并开始部署? [Y/n] " confirm || :
     confirm="${confirm:-Y}"
     [[ "${confirm}" =~ ^[Yy]$ ]] || die "用户取消部署"
 fi
 
 # ============== 1. 安装基础依赖 ==============
-info "更新 apt 并安装基础依赖..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl gnupg gettext >/dev/null
+case "${OS}" in
+    linux)
+        info "更新 apt 并安装基础依赖..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg gettext >/dev/null
+        command -v curl >/dev/null 2>&1 || die "curl 安装失败"
+        ;;
+    macos)
+        info "macOS: 使用 Homebrew, 系统自带 curl, 无需额外安装基础依赖"
+        ;;
+esac
 
-# ============== 2. 安装 Node.js (NodeSource) ==============
+# ============== 2. 安装 Node.js (NodeSource / Homebrew) ==============
 install_node() {
     if command -v node >/dev/null 2>&1; then
         local v
-        v=$(node -v | sed 's/v//; s/\..*//')
-        if (( v >= 18 )); then
+        v=$(node -v 2>/dev/null | sed -nE 's/^v?([0-9]+).*/\1/p' || true)
+        if [[ -n "${v}" && "${v}" -ge "${NODE_MIN_MAJOR}" ]]; then
             ok "已安装 Node.js $(node -v), 跳过"
             return 0
         fi
-        warn "Node.js 版本过低 ($(node -v)), 将安装 Node ${NODE_MAJOR}"
+        warn "Node.js 版本过低 ($(node -v 2>/dev/null || echo '未知')), 将安装 Node ${NODE_MAJOR}"
     fi
-    info "通过 NodeSource 安装 Node.js ${NODE_MAJOR}..."
-    apt-get install -y -qq gnupg >/dev/null
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
-        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
-        > /etc/apt/sources.list.d/nodesource.list
-    apt-get update -qq
-    apt-get install -y -qq nodejs >/dev/null
+    case "${OS}" in
+        linux)
+            info "通过 NodeSource 安装 Node.js ${NODE_MAJOR}..."
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
+                | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+                > /etc/apt/sources.list.d/nodesource.list
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends nodejs >/dev/null
+            ;;
+        macos)
+            # node@XX 为 keg-only 公式, 装完需手动 link 才能进入 PATH
+            info "通过 Homebrew 安装 Node.js ${NODE_MAJOR} (node@${NODE_MAJOR})..."
+            if ! brew install "node@${NODE_MAJOR}" >/dev/null 2>&1; then
+                warn "brew 安装 node@${NODE_MAJOR} 失败, 回退安装最新版 node"
+                brew install node
+            fi
+            if ! command -v node >/dev/null 2>&1; then
+                brew link --overwrite --force "node@${NODE_MAJOR}" >/dev/null 2>&1 || :
+            fi
+            ;;
+    esac
+    command -v node >/dev/null 2>&1 || die "Node.js 安装失败"
+    command -v npm >/dev/null 2>&1 || die "npm 未随 Node.js 安装, 请手动安装 npm"
     ok "Node.js 安装完成: $(node -v)"
 }
 install_node
 
 # ============== 3. 安装 Codex CLI ==============
+command -v npm >/dev/null 2>&1 || die "未找到 npm, 请先安装 npm 或重新安装 Node.js"
 info "通过 npm 全局安装 @openai/codex ..."
-npm install -g @openai/codex >/dev/null 2>&1 || die "npm 安装 codex 失败, 请检查网络/镜像源"
+npm_install_log=$(mktemp)
+npm_args=(install -g --no-audit --no-fund @openai/codex)
+[[ -n "${NPM_REGISTRY}" ]] && npm_args+=(--registry="${NPM_REGISTRY}")
+if ! npm "${npm_args[@]}" >"${npm_install_log}" 2>&1; then
+    cat "${npm_install_log}" >&2 || :
+    rm -f "${npm_install_log}"
+    die "npm 安装 codex 失败, 请检查网络/镜像源 (国内网络可设置 NPM_REGISTRY=https://registry.npmmirror.com)"
+fi
+rm -f "${npm_install_log}"
 command -v codex >/dev/null 2>&1 || die "codex 未在 PATH 中, 请检查 npm 全局 bin 目录"
 ok "Codex 安装完成: $(codex --version 2>/dev/null || echo 'installed')"
 
-# ============== 4. 写入配置文件 ==============
+# ============== 4. 写入配置文件 (先备份旧配置) ==============
 info "写入配置到 ${CODEX_DIR} ..."
-install -d -m 700 "${CODEX_DIR}"
+[[ -d "${CODEX_DIR}" ]] || install -d -m 700 "${CODEX_DIR}"
 
+# 备份已有配置 (保留最近 ${KEEP_BACKUPS} 份)
+KEEP_BACKUPS=5
+if [[ -f "${CODEX_DIR}/config.toml" || -f "${CODEX_DIR}/auth.json" ]]; then
+    backup_dir="${CODEX_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+    mkdir -p "${backup_dir}"
+    cp -p "${CODEX_DIR}/config.toml" "${backup_dir}/" 2>/dev/null || :
+    cp -p "${CODEX_DIR}/auth.json"   "${backup_dir}/" 2>/dev/null || :
+    ok "已备份旧配置到 ${backup_dir}"
+    # 删除超出保留份数的旧备份 (portable, 不依赖 GNU xargs -r)
+    while IFS= read -r old; do
+        rm -rf "${old}"
+    done < <(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null | tail -n "+$((KEEP_BACKUPS+1))")
+fi
+
+# 以 600 权限直接写入, 避免明文写入窗口
+( umask 077
 cat > "${CODEX_DIR}/config.toml" <<EOF
 model_provider = "OpenAI"
-model = "${CODEX_MODEL}"
-review_model = "${CODEX_REVIEW_MODEL}"
-model_reasoning_effort = "${CODEX_REASONING_EFFORT}"
+model = "$(escape_string "${CODEX_MODEL}")"
+review_model = "$(escape_string "${CODEX_REVIEW_MODEL}")"
+model_reasoning_effort = "$(escape_string "${CODEX_REASONING_EFFORT}")"
 disable_response_storage = true
 network_access = "enabled"
 
 [model_providers.OpenAI]
 name = "OpenAI"
-base_url = "${CODEX_BASE_URL}"
-wire_api = "${CODEX_WIRE_API}"
+base_url = "$(escape_string "${CODEX_BASE_URL}")"
+wire_api = "$(escape_string "${CODEX_WIRE_API}")"
 requires_openai_auth = true
 
 [features]
@@ -171,15 +305,15 @@ EOF
 
 cat > "${CODEX_DIR}/auth.json" <<EOF
 {
-  "OPENAI_API_KEY": "${CODEX_API_KEY}"
+  "OPENAI_API_KEY": "$(escape_string "${CODEX_API_KEY}")"
 }
 EOF
+)
 
 # ============== 5. 修正属主与权限 ==============
 chown -R "${TARGET_USER}:${TARGET_USER}" "${CODEX_DIR}"
 chmod 700 "${CODEX_DIR}"
-chmod 600 "${CODEX_DIR}/auth.json"
-chmod 644 "${CODEX_DIR}/config.toml"
+chmod 600 "${CODEX_DIR}/auth.json" "${CODEX_DIR}/config.toml"
 ok "权限设置完成"
 
 # ============== 6. 验证 ==============
@@ -187,9 +321,16 @@ info "配置预览(auth.json, 密钥已打码):"
 sed -E 's/(sk-[a-zA-Z0-9]{6})[a-zA-Z0-9]+/\1********/' "${CODEX_DIR}/auth.json"
 
 if curl -fsSL --connect-timeout 8 -o /dev/null "${CODEX_BASE_URL}" 2>/dev/null; then
-    ok "代理地址可达: ${CODEX_BASE_URL}"
+    ok "代理地址可达: $(mask_url "${CODEX_BASE_URL}")"
 else
-    warn "代理地址探测无响应(可能是正常的): ${CODEX_BASE_URL}"
+    warn "代理地址探测无响应(可能是正常的): $(mask_url "${CODEX_BASE_URL}")"
+fi
+
+# 检查目标用户的 PATH 中是否能看到 codex (仅 Linux; macOS 的 brew 默认已加入 PATH)
+if [[ "${OS}" == "linux" && "${TARGET_USER}" != "root" ]]; then
+    if ! su -s /bin/bash "${TARGET_USER}" -c 'command -v codex >/dev/null 2>&1'; then
+        warn "codex 命令可能不在 ${TARGET_USER} 的 PATH 中, 请确认 npm 全局 bin 目录已加入该用户 PATH"
+    fi
 fi
 
 echo
@@ -201,6 +342,6 @@ echo "  密钥 : ${CODEX_DIR}/auth.json"
 echo
 echo "  切换到该用户后直接运行:  codex"
 if [[ "${TARGET_USER}" != "$(id -un)" ]]; then
-    echo "  例如: su - ${TARGET_USER} -c codex"
+    echo "  例如: sudo -iu ${TARGET_USER} codex"
 fi
 echo "=================================="
