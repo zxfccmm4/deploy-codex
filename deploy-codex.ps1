@@ -1,7 +1,9 @@
-﻿<#
+<#
 Codex CLI 一键部署脚本（Windows PowerShell 5.1+ / PowerShell 7+）
+Version: 1.1.0
 
 参数优先级: 环境变量 > 交互输入 > 默认值
+与 deploy-codex.sh 对齐: auth 模式 / provider / 功能开关 / 配置保留 / --restore
 #>
 
 [CmdletBinding()]
@@ -9,11 +11,18 @@ param(
     [Alias('h')]
     [switch]$Help,
 
+    [Alias('V')]
+    [switch]$Version,
+
+    [Alias('r')]
+    [switch]$Restore,
+
     [switch]$NonInteractive
 )
 
 # 该脚本支持 irm <url> | iex。禁止在中止时直接 exit，以免关闭调用者的终端。
 $script:ABORT_SENTINEL = '__DEPLOY_CODEX_ABORT__'
+$script:SCRIPT_VERSION = '1.1.0'
 $script:SCRIPT_URL = 'https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.ps1'
 $script:INSTALL_CMD = "irm $($script:SCRIPT_URL) | iex"
 
@@ -46,24 +55,35 @@ function Stop-Deployment {
 
 function Show-Usage {
     Write-Host @"
+Codex CLI 一键部署脚本 v$($script:SCRIPT_VERSION)
+
 一行命令安装并配置 (终端内可交互提问):
   $($script:INSTALL_CMD)
   或加环境变量完全非交互 (适合 CI):
   `$env:CODEX_API_KEY='sk-xxxx'; `$env:CODEX_BASE_URL='https://your.proxy'; $($script:INSTALL_CMD)
 
 选项:
-  -h, -Help          显示本帮助
-  -NonInteractive   强制使用非交互模式
+  -h, -Help           显示本帮助
+  -V, -Version        显示脚本版本
+  -r, -Restore        用最近一次备份恢复配置
+  -NonInteractive     强制使用非交互模式
 
 参数通过环境变量传入(优先级: 环境变量 > 交互输入 > 默认值):
-  CODEX_API_KEY          必填, API Key
-  CODEX_BASE_URL         必填, API 代理地址
-  CODEX_MODEL            模型名, 默认 gpt-5.5
-  CODEX_REVIEW_MODEL     审查模型, 默认 gpt-5.5
-  CODEX_REASONING_EFFORT 推理强度, 默认 xhigh
-  CODEX_WIRE_API         responses / chat, 默认 responses
-  CODEX_HOME             Codex 配置目录, 默认 %USERPROFILE%\.codex
-  NPM_REGISTRY           npm 镜像源, 如 https://registry.npmmirror.com
+  CODEX_API_KEY / OPENAI_API_KEY  必填, API Key
+  CODEX_BASE_URL                  必填, API 代理地址
+  CODEX_MODEL                     模型名, 默认 gpt-5.5
+  CODEX_REVIEW_MODEL              审查模型, 默认 gpt-5.5
+  CODEX_REASONING_EFFORT          推理强度, 默认 xhigh
+  CODEX_WIRE_API                  responses / chat, 默认 responses
+  CODEX_PROVIDER                  model_provider 名称, 默认 OpenAI
+  CODEX_AUTH_STYLE                api_key | bearer | both, 默认 api_key
+  CODEX_GOALS                     features.goals, 默认 true
+  CODEX_DISABLE_RESPONSE_STORAGE  默认 true
+  CODEX_NETWORK_ACCESS            默认 enabled
+  CODEX_HOME                      Codex 配置目录, 默认 %USERPROFILE%\.codex
+  CODEX_PRESERVE_EXTRA            保留 plugins/marketplaces (1/0), 默认 1
+  NPM_REGISTRY                    npm 镜像源, 如 https://registry.npmmirror.com
+  KEEP_BACKUPS                    配置备份保留份数, 默认 5
 "@
 }
 
@@ -152,26 +172,21 @@ function Confirm-ApiKey {
     )
 
     $validatedKey = $ApiKey
-    $attempt = 0
-    while ($validatedKey -cnotmatch '^sk-') {
-        $attempt++
-        Write-Warn 'API Key 必须以 sk- 开头'
-
-        if (-not $IsInteractive) {
-            Stop-Deployment '非交互模式下 API Key 不以 sk- 开头, 已取消部署, 未修改任何文件'
-        }
-        if ($attempt -ge 3) {
-            Stop-Deployment '连续 3 次未获得有效 API Key (必须以 sk- 开头), 已取消部署, 未修改任何文件'
-        }
-
-        $validatedKey = Read-DeploymentInput -Prompt '  请重新输入 API Key (输入不回显)' -Secret
-        if ($validatedKey -cmatch '"') {
-            Stop-Deployment 'API Key 不能包含双引号, 已取消部署, 未修改任何文件'
-        }
+    if ($validatedKey -cmatch '"|`|\$') {
+        Stop-Deployment 'API Key 不能包含双引号、反引号或 $ 字符, 已取消部署, 未修改任何文件'
     }
 
-    if ($validatedKey -cmatch '"') {
-        Stop-Deployment 'API Key 不能包含双引号, 已取消部署, 未修改任何文件'
+    if ($validatedKey -cnotmatch '^sk-') {
+        Write-Warn 'API Key 未以 sk- 开头 (部分代理密钥格式不同)'
+        if ($IsInteractive) {
+            $confirm = Read-DeploymentInput -Prompt '  仍要继续? [y/N]'
+            if ($confirm -cnotmatch '^[Yy]$') {
+                Stop-Deployment '已取消部署 (未修改任何文件)'
+            }
+        }
+        else {
+            Write-Warn "非交互模式将继续使用非 sk- 前缀密钥: $(Get-MaskedKey -Key $validatedKey)"
+        }
     }
 
     return $validatedKey
@@ -310,10 +325,10 @@ function Test-GeneratedConfiguration {
 
         $configRaw = Get-Content -LiteralPath $ConfigTempPath -Raw -Encoding UTF8
         $requiredPatterns = @(
-            '(?m)^model_provider\s*=\s*"OpenAI"\s*$',
+            '(?m)^model_provider\s*=\s*".+"\s*$',
             '(?m)^model\s*=\s*".+"\s*$',
-            '(?m)^network_access\s*=\s*"enabled"\s*$',
-            '(?m)^\[model_providers\.OpenAI\]\s*$'
+            '(?m)^network_access\s*=\s*".+"\s*$',
+            '(?m)^\[model_providers\.[^\]]+\]\s*$'
         )
         foreach ($pattern in $requiredPatterns) {
             if ($configRaw -cnotmatch $pattern) {
@@ -366,6 +381,89 @@ function Write-CodexConfigurationAtomically {
     Protect-FileForCurrentUser -Path $AuthPath
 }
 
+
+function Get-EnvOrDefault {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$DefaultValue = ''
+    )
+    $value = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    if ([string]::IsNullOrEmpty($value)) {
+        return $DefaultValue
+    }
+    return $value
+}
+
+function Get-PreservedExtraSections {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return ''
+    }
+
+    $lines = Get-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $keep = $false
+    $buf = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        if ($line -cmatch '^\[(plugins|marketplaces)') {
+            $keep = $true
+        }
+        if ($keep) {
+            [void]$buf.Add($line)
+        }
+    }
+    return ($buf -join "`n")
+}
+
+function Restore-CodexBackup {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexDir,
+        [Parameter(Mandatory = $true)][bool]$IsInteractive
+    )
+
+    $parent = Split-Path -Parent $CodexDir
+    if ([string]::IsNullOrEmpty($parent)) { $parent = '.' }
+    $prefix = (Split-Path -Leaf $CodexDir) + '.bak.'
+    $backups = @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name.StartsWith($prefix) } |
+        Sort-Object LastWriteTime -Descending)
+
+    if ($backups.Count -eq 0) {
+        Stop-Deployment "未找到任何备份 ($CodexDir.bak.*), 无需恢复"
+    }
+
+    $latest = $backups[0]
+    Write-Host
+    Write-Info "将用以下备份恢复: $($latest.FullName)"
+    if ($IsInteractive) {
+        $confirm = Read-DeploymentInput -Prompt '确认恢复? [Y/n]'
+        if ([string]::IsNullOrEmpty($confirm)) { $confirm = 'Y' }
+        if ($confirm -cnotmatch '^[Yy]$') {
+            Stop-Deployment '已取消恢复'
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $CodexDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $CodexDir -Force | Out-Null
+    }
+
+    $srcConfig = Join-Path $latest.FullName 'config.toml'
+    $srcAuth = Join-Path $latest.FullName 'auth.json'
+    $dstConfig = Join-Path $CodexDir 'config.toml'
+    $dstAuth = Join-Path $CodexDir 'auth.json'
+
+    if (Test-Path -LiteralPath $srcConfig -PathType Leaf) {
+        Copy-Item -LiteralPath $srcConfig -Destination $dstConfig -Force
+        Protect-FileForCurrentUser -Path $dstConfig
+    }
+    if (Test-Path -LiteralPath $srcAuth -PathType Leaf) {
+        Copy-Item -LiteralPath $srcAuth -Destination $dstAuth -Force
+        Protect-FileForCurrentUser -Path $dstAuth
+    }
+
+    Write-Ok "已从 $($latest.FullName) 恢复配置"
+}
+
 function Invoke-DeployCodexMain {
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version Latest
@@ -379,11 +477,20 @@ function Invoke-DeployCodexMain {
             Show-Usage
             return
         }
+        if ($Version) {
+            Write-Host "deploy-codex $($script:SCRIPT_VERSION)"
+            return
+        }
 
         $defaultModel = 'gpt-5.5'
         $defaultReviewModel = 'gpt-5.5'
         $defaultReasoningEffort = 'xhigh'
         $defaultWireApi = 'responses'
+        $defaultProvider = 'OpenAI'
+        $defaultAuthStyle = 'api_key'
+        $defaultGoals = 'true'
+        $defaultDisableStorage = 'true'
+        $defaultNetworkAccess = 'enabled'
 
         if ([string]::IsNullOrEmpty($env:CODEX_HOME) -and [string]::IsNullOrEmpty($env:USERPROFILE)) {
             Stop-Deployment '未找到 USERPROFILE, 无法确定当前用户的家目录'
@@ -407,6 +514,17 @@ function Invoke-DeployCodexMain {
         $hostWasStartedNonInteractive = [Environment]::CommandLine -match '(?i)(?:^|\s)-(?:NonInteractive|NonI)(?:\s|$)'
         $isInteractive = (-not $NonInteractive) -and (-not $hostWasStartedNonInteractive)
 
+        if ($Restore) {
+            Restore-CodexBackup -CodexDir $codexDir -IsInteractive $isInteractive
+            return
+        }
+
+        # OPENAI_API_KEY 作为 CODEX_API_KEY 别名
+        if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('CODEX_API_KEY', 'Process')) -and
+            -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process'))) {
+            [Environment]::SetEnvironmentVariable('CODEX_API_KEY', $env:OPENAI_API_KEY, 'Process')
+        }
+
         Write-Host
         Write-Info '=========== Codex 配置参数 ==========='
         $CODEX_API_KEY = Get-DeploymentParameter -Name 'CODEX_API_KEY' -Message '  API Key (OPENAI_API_KEY)' -Secret -IsInteractive $isInteractive
@@ -415,6 +533,23 @@ function Invoke-DeployCodexMain {
         $CODEX_REVIEW_MODEL = Get-DeploymentParameter -Name 'CODEX_REVIEW_MODEL' -Message '  审查模型 (review_model)' -DefaultValue $defaultReviewModel -IsInteractive $isInteractive
         $CODEX_REASONING_EFFORT = Get-DeploymentParameter -Name 'CODEX_REASONING_EFFORT' -Message '  推理强度 (reasoning_effort)' -DefaultValue $defaultReasoningEffort -IsInteractive $isInteractive
         $CODEX_WIRE_API = Get-DeploymentParameter -Name 'CODEX_WIRE_API' -Message '  wire_api (responses/chat)' -DefaultValue $defaultWireApi -IsInteractive $isInteractive
+
+        $CODEX_PROVIDER = Get-EnvOrDefault -Name 'CODEX_PROVIDER' -DefaultValue $defaultProvider
+        $CODEX_AUTH_STYLE = Get-EnvOrDefault -Name 'CODEX_AUTH_STYLE' -DefaultValue $defaultAuthStyle
+        $CODEX_GOALS = Get-EnvOrDefault -Name 'CODEX_GOALS' -DefaultValue $defaultGoals
+        $CODEX_DISABLE_RESPONSE_STORAGE = Get-EnvOrDefault -Name 'CODEX_DISABLE_RESPONSE_STORAGE' -DefaultValue $defaultDisableStorage
+        $CODEX_NETWORK_ACCESS = Get-EnvOrDefault -Name 'CODEX_NETWORK_ACCESS' -DefaultValue $defaultNetworkAccess
+        $PRESERVE_EXTRA = Get-EnvOrDefault -Name 'CODEX_PRESERVE_EXTRA' -DefaultValue '1'
+        $keepBackupsRaw = Get-EnvOrDefault -Name 'KEEP_BACKUPS' -DefaultValue '5'
+        $keepBackups = 5
+        [void][int]::TryParse($keepBackupsRaw, [ref]$keepBackups)
+        if ($keepBackups -lt 1) { $keepBackups = 5 }
+
+        if ($isInteractive) {
+            $CODEX_PROVIDER = Get-DeploymentParameter -Name 'CODEX_PROVIDER' -Message '  provider 名称' -DefaultValue $CODEX_PROVIDER -IsInteractive $true
+            $CODEX_AUTH_STYLE = Get-DeploymentParameter -Name 'CODEX_AUTH_STYLE' -Message '  auth 写入方式 (api_key/bearer/both)' -DefaultValue $CODEX_AUTH_STYLE -IsInteractive $true
+        }
+
         $NPM_REGISTRY = [Environment]::GetEnvironmentVariable('NPM_REGISTRY', 'Process')
         if ($null -eq $NPM_REGISTRY) {
             $NPM_REGISTRY = ''
@@ -427,16 +562,34 @@ function Invoke-DeployCodexMain {
         if ($CODEX_BASE_URL -cnotmatch '^https?://') {
             Stop-Deployment "base_url 必须是 http(s):// 开头的地址, 当前值: $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
         }
+        if ($CODEX_AUTH_STYLE -cnotmatch '^(api_key|bearer|both)$') {
+            Stop-Deployment "CODEX_AUTH_STYLE 仅支持 api_key / bearer / both, 当前值: $CODEX_AUTH_STYLE"
+        }
+        if ($CODEX_PROVIDER -cnotmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
+            Stop-Deployment "CODEX_PROVIDER 仅允许字母开头的 [A-Za-z0-9_-], 当前值: $CODEX_PROVIDER"
+        }
+        if ($CODEX_GOALS -cnotmatch '^(true|false)$') {
+            Stop-Deployment "CODEX_GOALS 仅支持 true/false, 当前值: $CODEX_GOALS"
+        }
+        if ($CODEX_DISABLE_RESPONSE_STORAGE -cnotmatch '^(true|false)$') {
+            Stop-Deployment "CODEX_DISABLE_RESPONSE_STORAGE 仅支持 true/false, 当前值: $CODEX_DISABLE_RESPONSE_STORAGE"
+        }
 
         Write-Host
         Write-Info '配置摘要:'
         Write-Host "  目标用户    : $targetUser"
+        Write-Host "  配置目录    : $codexDir"
         Write-Host "  API Key     : $(Get-MaskedKey -Key $CODEX_API_KEY)"
         Write-Host "  base_url    : $(Get-MaskedUrl -Url $CODEX_BASE_URL)"
         Write-Host "  model       : $CODEX_MODEL"
         Write-Host "  review_model: $CODEX_REVIEW_MODEL"
         Write-Host "  effort      : $CODEX_REASONING_EFFORT"
         Write-Host "  wire_api    : $CODEX_WIRE_API"
+        Write-Host "  provider    : $CODEX_PROVIDER"
+        Write-Host "  auth_style  : $CODEX_AUTH_STYLE"
+        Write-Host "  goals       : $CODEX_GOALS"
+        Write-Host "  no_storage  : $CODEX_DISABLE_RESPONSE_STORAGE"
+        Write-Host "  network     : $CODEX_NETWORK_ACCESS"
         if (-not [string]::IsNullOrEmpty($NPM_REGISTRY)) {
             Write-Host "  npm 镜像    : $NPM_REGISTRY"
         }
@@ -515,9 +668,17 @@ function Invoke-DeployCodexMain {
                 $backupParent = '.'
             }
             $backupPrefix = (Split-Path -Leaf $codexDir) + '.bak.*'
-            $oldBackups = @(Get-ChildItem -LiteralPath $backupParent -Directory | Where-Object { $_.Name -like $backupPrefix } | Sort-Object Name -Descending | Select-Object -Skip 5)
+            $oldBackups = @(Get-ChildItem -LiteralPath $backupParent -Directory | Where-Object { $_.Name -like $backupPrefix } | Sort-Object Name -Descending | Select-Object -Skip $keepBackups)
             foreach ($oldBackup in $oldBackups) {
                 Remove-Item -LiteralPath $oldBackup.FullName -Recurse -Force
+            }
+        }
+
+        $preservedExtra = ''
+        if ($PRESERVE_EXTRA -eq '1') {
+            $preservedExtra = Get-PreservedExtraSections -ConfigPath $configPath
+            if (-not [string]::IsNullOrEmpty($preservedExtra)) {
+                Write-Info '将保留已有 plugins/marketplaces 配置段'
             }
         }
 
@@ -527,25 +688,36 @@ function Invoke-DeployCodexMain {
         $escapedBaseUrl = ConvertTo-ConfigString -Value $CODEX_BASE_URL
         $escapedWireApi = ConvertTo-ConfigString -Value $CODEX_WIRE_API
         $escapedApiKey = ConvertTo-ConfigString -Value $CODEX_API_KEY
+        $escapedProvider = ConvertTo-ConfigString -Value $CODEX_PROVIDER
+        $escapedNetwork = ConvertTo-ConfigString -Value $CODEX_NETWORK_ACCESS
 
-        $configContent = @(
-            'model_provider = "OpenAI"',
-            "model = `"$escapedModel`"",
-            "review_model = `"$escapedReviewModel`"",
-            "model_reasoning_effort = `"$escapedReasoningEffort`"",
-            'disable_response_storage = true',
-            'network_access = "enabled"',
-            '',
-            '[model_providers.OpenAI]',
-            'name = "OpenAI"',
-            "base_url = `"$escapedBaseUrl`"",
-            "wire_api = `"$escapedWireApi`"",
-            'requires_openai_auth = true',
-            '',
-            '[features]',
-            'goals = true'
-        ) -join "`n"
-        $configContent += "`n"
+        $configLines = New-Object System.Collections.Generic.List[string]
+        [void]$configLines.Add("model_provider = `"$escapedProvider`"")
+        [void]$configLines.Add("model = `"$escapedModel`"")
+        [void]$configLines.Add("review_model = `"$escapedReviewModel`"")
+        [void]$configLines.Add("model_reasoning_effort = `"$escapedReasoningEffort`"")
+        [void]$configLines.Add("disable_response_storage = $CODEX_DISABLE_RESPONSE_STORAGE")
+        [void]$configLines.Add("network_access = `"$escapedNetwork`"")
+        [void]$configLines.Add('')
+        [void]$configLines.Add("[model_providers.$escapedProvider]")
+        [void]$configLines.Add("name = `"$escapedProvider`"")
+        [void]$configLines.Add("base_url = `"$escapedBaseUrl`"")
+        [void]$configLines.Add("wire_api = `"$escapedWireApi`"")
+        [void]$configLines.Add('requires_openai_auth = true')
+        if ($CODEX_AUTH_STYLE -eq 'bearer' -or $CODEX_AUTH_STYLE -eq 'both') {
+            [void]$configLines.Add("experimental_bearer_token = `"$escapedApiKey`"")
+        }
+        [void]$configLines.Add('')
+        [void]$configLines.Add('[features]')
+        [void]$configLines.Add("goals = $CODEX_GOALS")
+        if (-not [string]::IsNullOrEmpty($preservedExtra)) {
+            [void]$configLines.Add('')
+            [void]$configLines.Add('# --- preserved from previous config ---')
+            foreach ($extraLine in ($preservedExtra -split "`n")) {
+                [void]$configLines.Add($extraLine)
+            }
+        }
+        $configContent = ($configLines -join "`n") + "`n"
 
         $authContent = @(
             '{',
@@ -578,6 +750,7 @@ function Invoke-DeployCodexMain {
 
         Write-Host
         Write-Ok '============ 部署完成 ============'
+        Write-Host "  版本 : deploy-codex v$($script:SCRIPT_VERSION)"
         Write-Host "  用户 : $targetUser"
         Write-Host "  命令 : $codexPath"
         Write-Host "  配置 : $configPath"
@@ -617,7 +790,11 @@ catch {
 
 或下载后运行:
   powershell -ExecutionPolicy Bypass -File deploy-codex.ps1
+  pwsh -File deploy-codex.ps1 -Version
+  pwsh -File deploy-codex.ps1 -Restore
 
 非交互式 (环境变量 + -NonInteractive):
-  $env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"; powershell -NonInteractive -ExecutionPolicy Bypass -File deploy-codex.ps1
+  $env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"
+  $env:CODEX_AUTH_STYLE="both"; $env:CODEX_PROVIDER="custom"
+  powershell -NonInteractive -ExecutionPolicy Bypass -File deploy-codex.ps1
 #>

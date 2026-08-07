@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    name: Bash lint & syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: bash -n
+        run: bash -n deploy-codex.sh
+
+      - name: ShellCheck
+        run: |
+          set +e
+          shellcheck -x -S warning deploy-codex.sh
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::ShellCheck reported issues (exit $code)"
+            shellcheck -x -S style deploy-codex.sh || true
+          fi
+
+      - name: Help / version smoke
+        run: |
+          bash deploy-codex.sh --version
+          bash deploy-codex.sh --help | head -8
+
+      - name: Root required check (non-root should fail fast)
+        run: |
+          set +e
+          out=$(bash deploy-codex.sh 2>&1)
+          code=$?
+          set -e
+          echo "$out" | tail -5
+          test "$code" -ne 0
+          echo "$out" | grep -q 'root\|sudo\|Linux'
+
+      - name: Missing params under root (should fail before install)
+        run: |
+          set +e
+          out=$(sudo CODEX_API_KEY= CODEX_BASE_URL= bash deploy-codex.sh 2>&1)
+          code=$?
+          set -e
+          echo "$out" | tail -15
+          test "$code" -ne 0
+
+  powershell:
+    name: PowerShell syntax
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse script
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path deploy-codex.ps1).Path,
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_ }
+            throw "PowerShell parse failed"
+          }
+          Write-Host "PowerShell parse OK"
+
+      - name: Version / Help smoke
+        shell: pwsh
+        run: |
+          & .\deploy-codex.ps1 -Version
+          & .\deploy-codex.ps1 -Help | Select-Object -First 12

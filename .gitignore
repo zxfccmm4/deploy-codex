@@ -1,17 +1,30 @@
-# macOS
+# OS
 .DS_Store
 .AppleDouble
 .LSOverride
+Thumbs.db
+Desktop.ini
 
-# 编辑器
+# Editors
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# 敏感信息(防止误提交)
+# Secrets / local env
 .env
 .env.*
 *.secret
 auth.json
+config.toml
+
+# Backups / local scratch
+*.bak
+*.bak.*
+*.tmp
+*.log
+
+# Node
+node_modules/
+npm-debug.log*

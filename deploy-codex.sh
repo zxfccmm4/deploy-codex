@@ -69,9 +69,9 @@ fi
 # ============== 颜色输出 ==============
 if [[ -t 1 ]]; then
     C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[0;31m'
-    C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'; C_NC='\033[0m'
+    C_BLUE='\033[0;34m'; C_NC='\033[0m'
 else
-    C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; C_CYAN=''; C_NC=''
+    C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; C_NC=''
 fi
 info()  { printf "${C_BLUE}[INFO]${C_NC} %s\n"  "$*"; }
 ok()    { printf "${C_GREEN}[ OK ]${C_NC} %s\n"  "$*"; }
@@ -213,6 +213,7 @@ if [[ "${1:-}" == "-r" || "${1:-}" == "--restore" ]]; then
     echo
     info "将用以下备份恢复: ${latest_backup}"
     if [[ "${INTERACTIVE}" -eq 1 ]]; then
+        confirm=""
         read_tty confirm "确认恢复? [Y/n] "
         confirm="${confirm:-Y}"
         [[ "${confirm}" =~ ^[Yy]$ ]] || die "已取消恢复"
@@ -312,6 +313,8 @@ fi
   || die "base_url 必须是 http(s):// 开头的地址, 当前值: $(mask_url "${CODEX_BASE_URL}")"
 [[ "${CODEX_AUTH_STYLE}" =~ ^(api_key|bearer|both)$ ]] \
   || die "CODEX_AUTH_STYLE 仅支持 api_key / bearer / both, 当前值: ${CODEX_AUTH_STYLE}"
+[[ "${CODEX_PROVIDER}" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] \
+  || die "CODEX_PROVIDER 仅允许字母开头的 [A-Za-z0-9_-], 当前值: ${CODEX_PROVIDER}"
 [[ "${CODEX_GOALS}" =~ ^(true|false)$ ]] \
   || die "CODEX_GOALS 仅支持 true/false, 当前值: ${CODEX_GOALS}"
 [[ "${CODEX_DISABLE_RESPONSE_STORAGE}" =~ ^(true|false)$ ]] \
@@ -324,6 +327,7 @@ esac
 if [[ "${CODEX_API_KEY}" != sk-* ]]; then
     if [[ "${INTERACTIVE}" -eq 1 ]]; then
         warn "API Key 未以 sk- 开头 (部分代理密钥格式不同)"
+        key_confirm=""
         read_tty key_confirm "  仍要继续? [y/N] "
         [[ "${key_confirm}" =~ ^[Yy]$ ]] || die "已取消部署 (未修改任何文件)"
     else
@@ -351,6 +355,7 @@ printf "  network     : %s\n" "${CODEX_NETWORK_ACCESS}"
 echo
 
 if [[ "${INTERACTIVE}" -eq 1 ]]; then
+    confirm=""
     read_tty confirm "确认以上配置并开始部署? [Y/n] "
     confirm="${confirm:-Y}"
     [[ "${confirm}" =~ ^[Yy]$ ]] || die "用户取消部署"
