@@ -1,9 +1,9 @@
 <#
 Codex CLI 一键部署脚本（Windows PowerShell 5.1+ / PowerShell 7+）
-Version: 1.1.0
+Version: 1.2.0
 
 参数优先级: 环境变量 > 交互输入 > 默认值
-与 deploy-codex.sh 对齐: auth 模式 / provider / 功能开关 / 配置保留 / --restore
+与 deploy-codex.sh 对齐: auth 模式 / provider / 功能开关 / 配置保留 / restore / dry-run / uninstall
 #>
 
 [CmdletBinding()]
@@ -17,12 +17,18 @@ param(
     [Alias('r')]
     [switch]$Restore,
 
+    [Alias('d')]
+    [switch]$DryRun,
+
+    [Alias('u')]
+    [switch]$Uninstall,
+
     [switch]$NonInteractive
 )
 
 # 该脚本支持 irm <url> | iex。禁止在中止时直接 exit，以免关闭调用者的终端。
 $script:ABORT_SENTINEL = '__DEPLOY_CODEX_ABORT__'
-$script:SCRIPT_VERSION = '1.1.0'
+$script:SCRIPT_VERSION = '1.2.0'
 $script:SCRIPT_URL = 'https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.ps1'
 $script:INSTALL_CMD = "irm $($script:SCRIPT_URL) | iex"
 
@@ -66,6 +72,8 @@ Codex CLI 一键部署脚本 v$($script:SCRIPT_VERSION)
   -h, -Help           显示本帮助
   -V, -Version        显示脚本版本
   -r, -Restore        用最近一次备份恢复配置
+  -d, -DryRun         只生成配置, 不安装 Node/npm/codex
+  -u, -Uninstall      卸载: 移除配置目录、备份, 并尝试 npm uninstall -g
   -NonInteractive     强制使用非交互模式
 
 参数通过环境变量传入(优先级: 环境变量 > 交互输入 > 默认值):
@@ -84,6 +92,7 @@ Codex CLI 一键部署脚本 v$($script:SCRIPT_VERSION)
   CODEX_PRESERVE_EXTRA            保留 plugins/marketplaces (1/0), 默认 1
   NPM_REGISTRY                    npm 镜像源, 如 https://registry.npmmirror.com
   KEEP_BACKUPS                    配置备份保留份数, 默认 5
+  CODEX_UNINSTALL_CONFIRM         非交互卸载时设为 1 确认删除
 "@
 }
 
@@ -464,6 +473,90 @@ function Restore-CodexBackup {
     Write-Ok "已从 $($latest.FullName) 恢复配置"
 }
 
+
+function Uninstall-CodexDeployment {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexDir,
+        [Parameter(Mandatory = $true)][bool]$IsInteractive
+    )
+
+    Write-Host
+    Write-Info '=========== 卸载 Codex 部署 ==========='
+    Write-Host "  配置目录 : $CodexDir"
+
+    $parent = Split-Path -Parent $CodexDir
+    if ([string]::IsNullOrEmpty($parent)) { $parent = '.' }
+    $prefix = (Split-Path -Leaf $CodexDir) + '.bak.'
+    $backups = @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name.StartsWith($prefix) })
+    Write-Host "  备份份数 : $($backups.Count)"
+
+    $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+    if ($null -ne $codexCmd) {
+        Write-Host "  codex    : $($codexCmd.Source)"
+    }
+    else {
+        Write-Host '  codex    : (未在 PATH 中找到)'
+    }
+    Write-Host
+
+    if ($IsInteractive) {
+        $confirm = Read-DeploymentInput -Prompt '确认卸载? 将删除配置目录与备份, 并尝试 npm uninstall -g @openai/codex [y/N]'
+        if ($confirm -cnotmatch '^[Yy]$') {
+            Stop-Deployment '已取消卸载'
+        }
+    }
+    else {
+        $confirmEnv = [Environment]::GetEnvironmentVariable('CODEX_UNINSTALL_CONFIRM', 'Process')
+        if ($confirmEnv -ne '1' -and $confirmEnv -ne 'yes') {
+            Stop-Deployment '非交互卸载请设置 CODEX_UNINSTALL_CONFIRM=1'
+        }
+    }
+
+    if (Test-Path -LiteralPath $CodexDir -PathType Container) {
+        Remove-Item -LiteralPath $CodexDir -Recurse -Force
+        Write-Ok "已删除 $CodexDir"
+    }
+    else {
+        Write-Warn "配置目录不存在: $CodexDir"
+    }
+
+    foreach ($bak in $backups) {
+        Remove-Item -LiteralPath $bak.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Ok "已删除备份 $($bak.FullName)"
+    }
+
+    $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
+    if ($null -ne $npmCommand) {
+        Write-Info '尝试 npm uninstall -g @openai/codex ...'
+        $saved = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $null = & $npmCommand.Source @('uninstall', '-g', '@openai/codex') 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok '已卸载 npm 全局包 @openai/codex'
+            }
+            else {
+                Write-Warn 'npm uninstall 失败或包未安装, 可手动执行: npm uninstall -g @openai/codex'
+            }
+        }
+        finally {
+            $ErrorActionPreference = $saved
+        }
+    }
+    else {
+        Write-Warn '未找到 npm, 跳过全局包卸载'
+    }
+
+    $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+    if ($null -ne $codexCmd) {
+        Write-Warn "PATH 中仍能找到 codex: $($codexCmd.Source) (可能是其他安装方式, 请手动删除)"
+    }
+
+    Write-Host
+    Write-Ok '============ 卸载完成 ============'
+}
+
 function Invoke-DeployCodexMain {
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version Latest
@@ -514,8 +607,22 @@ function Invoke-DeployCodexMain {
         $hostWasStartedNonInteractive = [Environment]::CommandLine -match '(?i)(?:^|\s)-(?:NonInteractive|NonI)(?:\s|$)'
         $isInteractive = (-not $NonInteractive) -and (-not $hostWasStartedNonInteractive)
 
+        if ($Restore -and $Uninstall) {
+            Stop-Deployment '不能同时指定 -Restore 与 -Uninstall'
+        }
+        if ($Restore -and $DryRun) {
+            Stop-Deployment '不能同时指定 -Restore 与 -DryRun'
+        }
+        if ($Uninstall -and $DryRun) {
+            Stop-Deployment '不能同时指定 -Uninstall 与 -DryRun'
+        }
+
         if ($Restore) {
             Restore-CodexBackup -CodexDir $codexDir -IsInteractive $isInteractive
+            return
+        }
+        if ($Uninstall) {
+            Uninstall-CodexDeployment -CodexDir $codexDir -IsInteractive $isInteractive
             return
         }
 
@@ -596,7 +703,12 @@ function Invoke-DeployCodexMain {
         Write-Host
 
         if ($isInteractive) {
-            $confirmation = Read-DeploymentInput -Prompt '确认以上配置并开始部署? [Y/n]'
+            $confirmPrompt = if ($DryRun) {
+                '确认以上配置并仅写入配置文件 (dry-run)? [Y/n]'
+            } else {
+                '确认以上配置并开始部署? [Y/n]'
+            }
+            $confirmation = Read-DeploymentInput -Prompt $confirmPrompt
             if ([string]::IsNullOrEmpty($confirmation)) {
                 $confirmation = 'Y'
             }
@@ -605,6 +717,7 @@ function Invoke-DeployCodexMain {
             }
         }
 
+        if (-not $DryRun) {
         Install-NodeIfNeeded
 
         $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
@@ -643,6 +756,10 @@ function Invoke-DeployCodexMain {
             $codexVersion = 'installed'
         }
         Write-Ok "Codex 安装完成: $codexVersion"
+        }
+        else {
+            Write-Info 'dry-run: 跳过 Node / npm / codex 安装, 仅生成配置'
+        }
 
         Write-Info "写入配置到 $codexDir ..."
         if (-not (Test-Path -LiteralPath $codexDir -PathType Container)) {
@@ -743,21 +860,39 @@ function Invoke-DeployCodexMain {
         }
 
         $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
-        if ($null -eq $codexCommand) {
-            Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
+        if (-not $DryRun) {
+            if ($null -eq $codexCommand) {
+                Stop-Deployment 'codex 未在 PATH 中, 请检查 npm 全局 bin 目录'
+            }
         }
-        $codexPath = $codexCommand.Source
+        $codexPath = if ($null -ne $codexCommand) { $codexCommand.Source } else { '(未安装)' }
 
         Write-Host
-        Write-Ok '============ 部署完成 ============'
-        Write-Host "  版本 : deploy-codex v$($script:SCRIPT_VERSION)"
-        Write-Host "  用户 : $targetUser"
-        Write-Host "  命令 : $codexPath"
-        Write-Host "  配置 : $configPath"
-        Write-Host "  密钥 : $authPath"
-        Write-Host
-        Write-Host '  直接运行:  codex'
-        Write-Host '=================================='
+        if ($DryRun) {
+            Write-Ok '============ dry-run 完成 (未安装软件包) ============'
+            Write-Host "  版本 : deploy-codex v$($script:SCRIPT_VERSION)"
+            Write-Host "  用户 : $targetUser"
+            Write-Host "  配置 : $configPath"
+            Write-Host "  密钥 : $authPath"
+            Write-Host
+            Write-Host '  正式部署请去掉 -DryRun 重新运行'
+            Write-Host '  恢复备份 : deploy-codex.ps1 -Restore'
+            Write-Host '  卸载清理 : deploy-codex.ps1 -Uninstall'
+            Write-Host '===================================================='
+        }
+        else {
+            Write-Ok '============ 部署完成 ============'
+            Write-Host "  版本 : deploy-codex v$($script:SCRIPT_VERSION)"
+            Write-Host "  用户 : $targetUser"
+            Write-Host "  命令 : $codexPath"
+            Write-Host "  配置 : $configPath"
+            Write-Host "  密钥 : $authPath"
+            Write-Host
+            Write-Host '  直接运行:  codex'
+            Write-Host '  恢复备份 : deploy-codex.ps1 -Restore'
+            Write-Host '  卸载清理 : deploy-codex.ps1 -Uninstall'
+            Write-Host '=================================='
+        }
     }
     finally {
         $CODEX_API_KEY = $null
@@ -791,7 +926,9 @@ catch {
 或下载后运行:
   powershell -ExecutionPolicy Bypass -File deploy-codex.ps1
   pwsh -File deploy-codex.ps1 -Version
+  pwsh -File deploy-codex.ps1 -DryRun
   pwsh -File deploy-codex.ps1 -Restore
+  pwsh -File deploy-codex.ps1 -Uninstall
 
 非交互式 (环境变量 + -NonInteractive):
   $env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"

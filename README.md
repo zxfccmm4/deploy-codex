@@ -3,7 +3,7 @@
 [![CI](https://github.com/zxfccmm4/deploy-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/zxfccmm4/deploy-codex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **v1.1.0** · 适用于 **Debian 12 / Ubuntu / macOS / Windows**，一键安装并配置 [OpenAI Codex CLI](https://github.com/openai/codex)。
+> **v1.2.0** · 适用于 **Debian 12 / Ubuntu / macOS / Windows**，一键安装并配置 [OpenAI Codex CLI](https://github.com/openai/codex)。
 
 ## 支持平台
 
@@ -13,7 +13,7 @@
 | macOS（Darwin） | `deploy-codex.sh` | Homebrew `node@22` | **普通用户**（**不要** `sudo`） |
 | Windows（PS 5.1+ / 7+） | `deploy-codex.ps1` | winget Node LTS | 当前用户 |
 
-## 优化亮点（1.1.0）
+## 优化亮点（1.2.0）
 
 - **macOS 无 root**：禁止用 `sudo` 跑 brew，避免污染系统
 - **auth 写入方式**：`CODEX_AUTH_STYLE=api_key | bearer | both`（代理可用 `experimental_bearer_token`）
@@ -24,7 +24,9 @@
 - **备份与恢复**：自动备份最近 N 份；`--restore` / `-Restore` 一键回滚
 - **管道可交互**：`curl | bash` / `irm | iex` 在终端里也能提问
 - **密钥别名**：`OPENAI_API_KEY` 可代替 `CODEX_API_KEY`
-- **CI**：ShellCheck + `bash -n` + PowerShell 语法检查
+- **CI**：ShellCheck + `bash -n` + PowerShell 语法检查（`actions/checkout@v5` / Node 24）
+- **dry-run**：`--dry-run` / `-DryRun` 只写配置，不装 Node/npm/codex
+- **卸载清理**：`--uninstall` / `-Uninstall` 删除配置与备份，并尝试 `npm uninstall -g @openai/codex`
 
 ## 快速开始
 
@@ -63,6 +65,8 @@ sudo bash deploy-codex.sh     # Linux
 # bash deploy-codex.sh        # macOS
 bash deploy-codex.sh --restore
 bash deploy-codex.sh --version
+bash deploy-codex.sh --dry-run          # 只写配置
+bash deploy-codex.sh --uninstall        # 卸载清理
 ```
 
 ### Windows（PowerShell）
@@ -80,7 +84,9 @@ irm https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.ps
 # 下载后
 powershell -ExecutionPolicy Bypass -File deploy-codex.ps1
 pwsh -File deploy-codex.ps1 -Version
+pwsh -File deploy-codex.ps1 -DryRun
 pwsh -File deploy-codex.ps1 -Restore
+pwsh -File deploy-codex.ps1 -Uninstall
 ```
 
 运行后会依次提示（**回车采用默认值**；API Key / base_url 必填）：
@@ -118,6 +124,7 @@ pwsh -File deploy-codex.ps1 -Restore
 | `NODE_MAJOR` | Node 主版本（Linux/macOS） | `22` |
 | `NPM_REGISTRY` | npm 镜像，如 `https://registry.npmmirror.com` | — |
 | `KEEP_BACKUPS` | 配置备份保留份数 | `5` |
+| `CODEX_UNINSTALL_CONFIRM` | 非交互卸载确认（`1` / `yes`） | — |
 
 ### `CODEX_AUTH_STYLE` 说明
 
@@ -135,6 +142,47 @@ codex
 
 - 用 `sudo` 执行时，配置写到 `SUDO_USER` 的家目录，而不是 `/root`
 - macOS 请用执行部署的同一用户直接运行 `codex`
+
+
+## dry-run 与卸载
+
+### 只生成配置（不安装软件包）
+
+适合先审阅会写出的 `config.toml` / `auth.json`，或在 CI 里校验参数：
+
+```bash
+# Linux
+sudo CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" \
+  bash deploy-codex.sh --dry-run
+
+# macOS
+CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" \
+  bash deploy-codex.sh --dry-run
+```
+
+```powershell
+$env:CODEX_API_KEY="sk-xxxx"; $env:CODEX_BASE_URL="https://your.proxy"
+pwsh -File deploy-codex.ps1 -DryRun -NonInteractive
+```
+
+### 卸载 / 清理
+
+会删除 `CODEX_HOME`（默认 `~/.codex`）、同级 `.bak.*` 备份，并尝试 `npm uninstall -g @openai/codex`。  
+**不会**删除系统 Node / Homebrew / 其他方式安装的 `codex` 二进制。
+
+```bash
+# 交互确认
+bash deploy-codex.sh --uninstall
+
+# 非交互（必须显式确认）
+CODEX_UNINSTALL_CONFIRM=1 bash deploy-codex.sh --uninstall
+```
+
+```powershell
+pwsh -File deploy-codex.ps1 -Uninstall
+$env:CODEX_UNINSTALL_CONFIRM="1"
+pwsh -File deploy-codex.ps1 -Uninstall -NonInteractive
+```
 
 ## 安全说明
 

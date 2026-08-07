@@ -14,7 +14,8 @@ jobs:
     name: Bash lint & syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # v5+ runs on Node 24 (avoids Node 20 deprecation on Actions)
+      - uses: actions/checkout@v5
 
       - name: Install ShellCheck
         run: |
@@ -38,7 +39,7 @@ jobs:
       - name: Help / version smoke
         run: |
           bash deploy-codex.sh --version
-          bash deploy-codex.sh --help | head -8
+          bash deploy-codex.sh --help | head -12
 
       - name: Root required check (non-root should fail fast)
         run: |
@@ -59,11 +60,47 @@ jobs:
           echo "$out" | tail -15
           test "$code" -ne 0
 
+      - name: Dry-run writes config only (no npm install of codex)
+        run: |
+          tmp=$(mktemp -d)
+          codex_home="$tmp/codex"
+          sudo CODEX_HOME="$codex_home" \
+               CODEX_API_KEY='sk-ci-dryrun-key-abcdefgh' \
+               CODEX_BASE_URL='https://example.com/v1' \
+               CODEX_PROVIDER='custom' \
+               CODEX_AUTH_STYLE='both' \
+               bash deploy-codex.sh --dry-run
+          test -f "$codex_home/config.toml"
+          test -f "$codex_home/auth.json"
+          grep -q 'model_provider = "custom"' "$codex_home/config.toml"
+          grep -q 'experimental_bearer_token' "$codex_home/config.toml"
+          # codex binary should not be required by dry-run
+          echo "dry-run OK"
+          # uninstall with confirm
+          sudo CODEX_HOME="$codex_home" CODEX_UNINSTALL_CONFIRM=1 bash deploy-codex.sh --uninstall
+          test ! -e "$codex_home"
+          echo "uninstall OK"
+          sudo rm -rf "$tmp"
+
+      - name: Uninstall without confirm fails
+        run: |
+          tmp=$(mktemp -d)
+          mkdir -p "$tmp/codex"
+          echo 'x' > "$tmp/codex/config.toml"
+          set +e
+          out=$(sudo CODEX_HOME="$tmp/codex" bash deploy-codex.sh --uninstall 2>&1)
+          code=$?
+          set -e
+          echo "$out" | tail -8
+          test "$code" -ne 0
+          test -d "$tmp/codex"
+          sudo rm -rf "$tmp"
+
   powershell:
     name: PowerShell syntax
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Parse script
         shell: pwsh
@@ -80,8 +117,31 @@ jobs:
           }
           Write-Host "PowerShell parse OK"
 
-      - name: Version / Help smoke
+      - name: Version / Help / flag smoke
         shell: pwsh
         run: |
           & .\deploy-codex.ps1 -Version
-          & .\deploy-codex.ps1 -Help | Select-Object -First 12
+          & .\deploy-codex.ps1 -Help | Select-Object -First 16
+
+      - name: DryRun + Uninstall smoke
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:TEMP ("deploy-codex-ci-" + [guid]::NewGuid().ToString())
+          $codexHome = Join-Path $tmp 'codex'
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $env:CODEX_HOME = $codexHome
+          $env:CODEX_API_KEY = 'sk-ci-dryrun-key-abcdefgh'
+          $env:CODEX_BASE_URL = 'https://example.com/v1'
+          $env:CODEX_PROVIDER = 'custom'
+          $env:CODEX_AUTH_STYLE = 'both'
+          & .\deploy-codex.ps1 -DryRun -NonInteractive
+          if (-not (Test-Path -LiteralPath (Join-Path $codexHome 'config.toml'))) {
+            throw 'config.toml missing after DryRun'
+          }
+          $env:CODEX_UNINSTALL_CONFIRM = '1'
+          & .\deploy-codex.ps1 -Uninstall -NonInteractive
+          if (Test-Path -LiteralPath $codexHome) {
+            throw 'codex home still exists after Uninstall'
+          }
+          Write-Host 'DryRun + Uninstall OK'
+          Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

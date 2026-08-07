@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Codex CLI 一键部署脚本（Debian 12 / Ubuntu / macOS）
-# Version: 1.1.0
+# Version: 1.2.0
 #
 # 一行命令即可完成安装与配置 (终端内可交互提问):
 #   # Linux:
@@ -19,6 +19,8 @@
 #                 sudo bash deploy-codex.sh     # Linux
 #   恢复备份:     bash deploy-codex.sh --restore
 #   版本信息:     bash deploy-codex.sh --version
+#   仅写配置:     bash deploy-codex.sh --dry-run
+#   卸载清理:     bash deploy-codex.sh --uninstall
 #
 # 平台支持:
 #   - Linux (Debian 12 / Ubuntu): apt-get + NodeSource (需 root)
@@ -30,7 +32,7 @@ set -euo pipefail
 # 避免 bash <(curl ...) 场景下 Ctrl+C 导致 curl 报 (23) 写错误;
 # 同时保证管道模式下 stdin 已被读完, read_tty 得以回退到 /dev/tty 交互提问。
 {
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_URL="https://raw.githubusercontent.com/zxfccmm4/deploy-codex/main/deploy-codex.sh"
 
 # 临时文件列表 (中断时清理)
@@ -79,10 +81,15 @@ warn()  { printf "${C_YELLOW}[WARN]${C_NC} %s\n" "$*"; }
 die()   { printf "${C_RED}[FAIL]${C_NC} %s\n" "$*" >&2; exit 1; }
 
 # ============== 交互式输入 ==============
-# stdin 是 tty 或 /dev/tty 可读都视为可交互 (支持 curl | bash 管道中提问)
+# stdin 是 tty, 或能真正打开 /dev/tty 时视为可交互 (支持 curl | bash 管道中提问)
+# 注意: 仅 -r /dev/tty 不够 — CI/沙箱里设备节点可能存在但无法 open
 INTERACTIVE=1
-if [[ ! -t 0 ]] && [[ ! -r /dev/tty ]]; then
-    INTERACTIVE=0
+if [[ ! -t 0 ]]; then
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        INTERACTIVE=0
+    else
+        exec 3>&- 3<&- 2>/dev/null || true
+    fi
 fi
 
 # read_tty <变量名> <提示语> <是否隐藏输入 0/1>
@@ -134,9 +141,11 @@ Codex CLI 一键部署脚本 v${SCRIPT_VERSION}
   curl -fsSL ${SCRIPT_URL} | $([ "${OS}" = "linux" ] && echo 'sudo ')CODEX_API_KEY="sk-xxxx" CODEX_BASE_URL="https://your.proxy" bash
 
 选项:
-  -h, --help     显示本帮助
-  -r, --restore  用最近一次的备份恢复配置
-  -V, --version  显示脚本版本
+  -h, --help       显示本帮助
+  -V, --version    显示脚本版本
+  -r, --restore    用最近一次的备份恢复配置
+  -d, --dry-run    只生成/预览配置, 不安装 Node/npm/codex
+  -u, --uninstall  卸载: 移除配置目录、备份, 并尝试 npm uninstall -g @openai/codex
 
 参数通过环境变量传入(优先级: 环境变量 > 交互输入 > 默认值):
   CODEX_API_KEY / OPENAI_API_KEY  必填, API Key
@@ -157,10 +166,20 @@ Codex CLI 一键部署脚本 v${SCRIPT_VERSION}
   KEEP_BACKUPS                    配置备份保留份数, 默认 ${KEEP_BACKUPS}
 EOF
 }
-case "${1:-}" in
-    -h|--help)    usage; exit 0 ;;
-    -V|--version) printf 'deploy-codex %s\n' "${SCRIPT_VERSION}"; exit 0 ;;
-esac
+MODE="deploy"   # deploy | restore | dry-run | uninstall
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)       usage; exit 0 ;;
+        -V|--version)    printf 'deploy-codex %s\n' "${SCRIPT_VERSION}"; exit 0 ;;
+        -r|--restore)    MODE="restore" ;;
+        -d|--dry-run)    MODE="dry-run" ;;
+        -u|--uninstall)  MODE="uninstall" ;;
+        --)              shift; break ;;
+        -*)              die "未知选项: $1 (用 --help 查看)" ;;
+        *)               die "未知参数: $1 (用 --help 查看)" ;;
+    esac
+    shift
+done
 
 # ============== 前置检查 ==============
 case "${OS}" in
@@ -176,8 +195,10 @@ case "${OS}" in
         if [[ $EUID -eq 0 ]]; then
             die "macOS 请勿使用 sudo 运行本脚本 (Homebrew 禁止 root)。请用普通用户: ${INSTALL_CMD}"
         fi
-        command -v brew >/dev/null 2>&1 \
-          || die "未找到 Homebrew, 请先安装: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        # brew 仅在完整部署时必需; dry-run / restore / uninstall 可无 brew
+        if [[ "${MODE}" == "deploy" ]] && ! command -v brew >/dev/null 2>&1; then
+            die "未找到 Homebrew, 请先安装: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        fi
         ;;
 esac
 
@@ -207,7 +228,7 @@ fi
 CODEX_DIR="${CODEX_HOME:-${TARGET_HOME}/.codex}"
 
 # ============== 恢复最近一次备份 (--restore) ==============
-if [[ "${1:-}" == "-r" || "${1:-}" == "--restore" ]]; then
+if [[ "${MODE}" == "restore" ]]; then
     latest_backup=$(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null | head -1 || true)
     [[ -n "${latest_backup}" ]] || die "未找到任何备份 (${CODEX_DIR}.bak.*), 无需恢复"
     echo
@@ -227,6 +248,69 @@ if [[ "${1:-}" == "-r" || "${1:-}" == "--restore" ]]; then
     chmod 700 "${CODEX_DIR}"
     chmod 600 "${CODEX_DIR}/auth.json" "${CODEX_DIR}/config.toml" 2>/dev/null || true
     ok "已从 ${latest_backup} 恢复配置"
+    exit 0
+fi
+
+# ============== 卸载 / 清理 (--uninstall) ==============
+if [[ "${MODE}" == "uninstall" ]]; then
+    echo
+    info "=========== 卸载 Codex 部署 ==========="
+    printf "  配置目录 : %s\n" "${CODEX_DIR}"
+    # 列举备份 (portable, 不依赖 bash 4 mapfile)
+    _bak_count=0
+    while IFS= read -r _b; do
+        [[ -n "${_b}" ]] || continue
+        _bak_count=$((_bak_count + 1))
+    done < <(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null || true)
+    printf "  备份份数 : %s\n" "${_bak_count}"
+    if command -v codex >/dev/null 2>&1; then
+        printf "  codex    : %s\n" "$(command -v codex)"
+    else
+        printf "  codex    : (未在 PATH 中找到)\n"
+    fi
+    echo
+    if [[ "${INTERACTIVE}" -eq 1 ]]; then
+        confirm=""
+        read_tty confirm "确认卸载? 将删除配置目录与备份, 并尝试 npm uninstall -g @openai/codex [y/N] "
+        [[ "${confirm}" =~ ^[Yy]$ ]] || die "已取消卸载"
+    else
+        # 非交互卸载需显式确认, 防止 CI/脚本误删
+        if [[ "${CODEX_UNINSTALL_CONFIRM:-}" != "1" && "${CODEX_UNINSTALL_CONFIRM:-}" != "yes" ]]; then
+            die "非交互卸载请设置 CODEX_UNINSTALL_CONFIRM=1"
+        fi
+    fi
+
+    # 1) 移除配置与备份
+    if [[ -d "${CODEX_DIR}" ]]; then
+        rm -rf "${CODEX_DIR}"
+        ok "已删除 ${CODEX_DIR}"
+    else
+        warn "配置目录不存在: ${CODEX_DIR}"
+    fi
+    while IFS= read -r old; do
+        [[ -n "${old}" ]] || continue
+        rm -rf "${old}"
+        ok "已删除备份 ${old}"
+    done < <(ls -dt "${CODEX_DIR}".bak.* 2>/dev/null || true)
+
+    # 2) npm 全局卸载 (尽力而为, 失败不致命)
+    if command -v npm >/dev/null 2>&1; then
+        info "尝试 npm uninstall -g @openai/codex ..."
+        if npm uninstall -g @openai/codex >/dev/null 2>&1; then
+            ok "已卸载 npm 全局包 @openai/codex"
+        else
+            warn "npm uninstall 失败或包未安装, 可手动执行: npm uninstall -g @openai/codex"
+        fi
+    else
+        warn "未找到 npm, 跳过全局包卸载"
+    fi
+
+    # 3) 提示残留
+    if command -v codex >/dev/null 2>&1; then
+        warn "PATH 中仍能找到 codex: $(command -v codex) (可能是其他安装方式, 请手动删除)"
+    fi
+    echo
+    ok "============ 卸载完成 ============"
     exit 0
 fi
 
@@ -356,12 +440,19 @@ echo
 
 if [[ "${INTERACTIVE}" -eq 1 ]]; then
     confirm=""
-    read_tty confirm "确认以上配置并开始部署? [Y/n] "
+    if [[ "${MODE}" == "dry-run" ]]; then
+        read_tty confirm "确认以上配置并仅写入配置文件 (dry-run)? [Y/n] "
+    else
+        read_tty confirm "确认以上配置并开始部署? [Y/n] "
+    fi
     confirm="${confirm:-Y}"
     [[ "${confirm}" =~ ^[Yy]$ ]] || die "用户取消部署"
 fi
 
-# ============== 1. 安装基础依赖 ==============
+# ============== 1. 安装基础依赖 (dry-run 跳过) ==============
+if [[ "${MODE}" == "dry-run" ]]; then
+    info "dry-run: 跳过依赖 / Node / npm 安装, 仅生成配置"
+else
 case "${OS}" in
     linux)
         info "更新 apt 并安装基础依赖..."
@@ -440,6 +531,7 @@ if [[ "${OS}" == "macos" ]]; then
 fi
 command -v codex >/dev/null 2>&1 || die "codex 未在 PATH 中, 请检查 npm 全局 bin 目录 (npm bin -g)"
 ok "Codex 安装完成: $(codex --version 2>/dev/null || echo 'installed')"
+fi  # end non-dry-run install block
 
 # ============== 4. 写入配置文件 (先备份旧配置) ==============
 info "写入配置到 ${CODEX_DIR} ..."
@@ -601,8 +693,8 @@ else
     warn "代理地址探测无响应(可能是正常的): $(mask_url "${CODEX_BASE_URL}")"
 fi
 
-# 检查目标用户的 PATH 中是否能看到 codex (仅 Linux; macOS 的 brew 默认已加入 PATH)
-if [[ "${OS}" == "linux" && "${TARGET_USER}" != "root" ]]; then
+# 检查目标用户的 PATH 中是否能看到 codex (仅 Linux; dry-run 跳过)
+if [[ "${MODE}" != "dry-run" && "${OS}" == "linux" && "${TARGET_USER}" != "root" ]]; then
     if ! su -s /bin/bash "${TARGET_USER}" -c 'command -v codex >/dev/null 2>&1'; then
         warn "codex 命令可能不在 ${TARGET_USER} 的 PATH 中, 请确认 npm 全局 bin 目录已加入该用户 PATH"
         warn "可尝试: npm bin -g  并将输出目录写入 ~/.bashrc / ~/.profile"
@@ -610,19 +702,37 @@ if [[ "${OS}" == "linux" && "${TARGET_USER}" != "root" ]]; then
 fi
 
 echo
-ok "============ 部署完成 ============"
-echo "  版本 : deploy-codex v${SCRIPT_VERSION}"
-echo "  用户 : ${TARGET_USER}"
-echo "  命令 : $(command -v codex)"
-echo "  配置 : ${CODEX_DIR}/config.toml"
-echo "  密钥 : ${CODEX_DIR}/auth.json"
-echo
-echo "  切换到该用户后直接运行:  codex"
-if [[ "${TARGET_USER}" != "$(id -un)" ]]; then
-    echo "  例如: sudo -iu ${TARGET_USER} codex"
+if [[ "${MODE}" == "dry-run" ]]; then
+    ok "============ dry-run 完成 (未安装软件包) ============"
+    echo "  版本 : deploy-codex v${SCRIPT_VERSION}"
+    echo "  用户 : ${TARGET_USER}"
+    echo "  配置 : ${CODEX_DIR}/config.toml"
+    echo "  密钥 : ${CODEX_DIR}/auth.json"
+    echo
+    echo "  正式部署请去掉 --dry-run 重新运行"
+    echo "  恢复备份 : bash deploy-codex.sh --restore"
+    echo "  卸载清理 : bash deploy-codex.sh --uninstall"
+    echo "===================================================="
+else
+    ok "============ 部署完成 ============"
+    echo "  版本 : deploy-codex v${SCRIPT_VERSION}"
+    echo "  用户 : ${TARGET_USER}"
+    if command -v codex >/dev/null 2>&1; then
+        echo "  命令 : $(command -v codex)"
+    else
+        echo "  命令 : (codex 未在 PATH)"
+    fi
+    echo "  配置 : ${CODEX_DIR}/config.toml"
+    echo "  密钥 : ${CODEX_DIR}/auth.json"
+    echo
+    echo "  切换到该用户后直接运行:  codex"
+    if [[ "${TARGET_USER}" != "$(id -un)" ]]; then
+        echo "  例如: sudo -iu ${TARGET_USER} codex"
+    fi
+    echo "  恢复备份 : bash deploy-codex.sh --restore"
+    echo "  卸载清理 : bash deploy-codex.sh --uninstall"
+    echo "  或远程   : ${INSTALL_CMD%bash*}bash -s -- --restore"
+    echo "=================================="
 fi
-echo "  恢复备份 : bash deploy-codex.sh --restore"
-echo "  或远程   : ${INSTALL_CMD%bash*}bash -s -- --restore"
-echo "=================================="
 
 }
