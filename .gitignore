@@ -17,7 +17,7 @@ Desktop.ini
 .env.*
 *.secret
 auth.json
-config.toml
+/config.toml
 
 # Backups / local scratch
 *.bak

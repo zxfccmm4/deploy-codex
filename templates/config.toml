@@ -1,0 +1,10 @@
+model_provider = "OpenAI"
+model = "gpt-5.6-sol"
+model_catalog_json = "__MODEL_CATALOG_JSON__"
+review_model = "gpt-5.5"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://opencode.2020713.xyz"
+wire_api = "responses"
+requires_openai_auth = true
