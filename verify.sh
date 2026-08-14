@@ -173,10 +173,15 @@ fi
 
 if [[ "${CODEX_LIVE_VERIFY:-0}" == "1" ]]; then
     command -v codex >/dev/null 2>&1 || fail "未找到 codex 命令"
+    live_sandbox="${CODEX_LIVE_SANDBOX:-workspace-write}"
+    if [[ "${live_sandbox}" == "read-only" ]]; then
+        fail "GPT-5.6 code mode 在 read-only sandbox 下可能不会获得 exec；请使用 CODEX_LIVE_SANDBOX=workspace-write"
+    fi
     output_file="$(mktemp)"
     trap 'rm -f "${output_file:-}"' EXIT
+    # GPT-5.6 code mode 在 read-only sandbox 下可能收到空工具列表。
     CODEX_HOME="${CODEX_DIR}" codex --ask-for-approval never exec \
-        --ephemeral --skip-git-repo-check --sandbox read-only \
+        --ephemeral --skip-git-repo-check --sandbox "${live_sandbox}" \
         --output-last-message "${output_file}" \
         '先调用 exec 工具运行 printf CODEX_EXEC_OK，然后只回复该命令的输出。'
     grep -Fq 'CODEX_EXEC_OK' "${output_file}" || fail "Codex exec 实际调用验证失败"

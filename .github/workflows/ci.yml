@@ -53,6 +53,13 @@ jobs:
           ! grep -RIE 'sk-[A-Za-z0-9_-]{16,}|Bearer[[:space:]]+[A-Za-z0-9._-]{16,}' \
             assets templates deploy.sh verify.sh
 
+      - name: Live verification sandbox regression check
+        run: |
+          grep -Fq 'CODEX_LIVE_SANDBOX:-workspace-write' verify.sh
+          grep -Fq -- '--sandbox "${live_sandbox}"' verify.sh
+          ! grep -Fq -- '--sandbox read-only' verify.sh
+          grep -Fq -- '--sandbox workspace-write' README.md
+
       - name: Portable deploy smoke
         run: |
           tmp=$(mktemp -d)

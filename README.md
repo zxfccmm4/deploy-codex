@@ -103,6 +103,7 @@ sudo CODEX_TARGET_USER=alice bash verify.sh
 | `CODEX_SKIP_INSTALL=1` | 只部署目录与配置，不执行 npm 全局安装 | `0` |
 | `CODEX_SKIP_VERSION_CHECK=1` | 验证时跳过 CLI 版本检查 | `0` |
 | `CODEX_LIVE_VERIFY=1` | 验证时发起真实 API 请求，并要求模型实际调用 `exec` | `0` |
+| `CODEX_LIVE_SANDBOX` | 真实工具调用验证使用的 sandbox；GPT-5.6 不应设为 `read-only` | `workspace-write` |
 
 `deploy.sh` 需要系统已有 Node.js/npm；如果 Codex CLI 已通过其他方式安装，可设置 `CODEX_SKIP_INSTALL=1`。覆盖已有 `config.toml` 前会生成带时间戳的备份。
 
@@ -130,10 +131,13 @@ npm 包中的 helper 可能位于平台包的 `vendor/.../bin/` 内，不一定�
 ```bash
 CODEX_LIVE_VERIFY=1 bash verify.sh
 
-# 也可手工询问；预期包含 exec、apply_patch 等工具名
+# 也可手工验证；必须让模型实际调用工具，而不是只让它列出工具名
 codex exec --ephemeral --skip-git-repo-check \
-  '你现在可以使用的终端工具有哪些？只列出工具名。'
+  --sandbox workspace-write \
+  '先调用 exec 工具运行 printf CODEX_EXEC_OK，然后只回复该命令的输出。'
 ```
+
+GPT-5.6 code mode 当前在 `--sandbox read-only` 下可能收到空工具列表，从而回复“无法可靠访问工作区执行工具”或 `NO-TOOLS`；请使用 `workspace-write`。参见 [openai/codex#31843](https://github.com/openai/codex/issues/31843)。另外，`apply_patch` 在 code mode 中可能作为 `exec` 内的 freeform 工具提供，不一定以独立顶层工具名出现，因此最可靠的检查方式是让模型实际执行上面的 `printf CODEX_EXEC_OK`。
 
 ### Windows（PowerShell）
 
