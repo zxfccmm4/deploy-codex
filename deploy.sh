@@ -86,6 +86,91 @@ JS
     die "需要 python3 或 node 来校验模型目录"
 }
 
+resolve_executable() {
+    local path="$1"
+    local link_dir=""
+    local link_target=""
+
+    while [[ -L "${path}" ]]; do
+        link_dir="$(cd -P -- "$(dirname -- "${path}")" && pwd)"
+        link_target="$(readlink "${path}")"
+        if [[ "${link_target}" == /* ]]; then
+            path="${link_target}"
+        else
+            path="${link_dir}/${link_target}"
+        fi
+    done
+
+    printf '%s\n' "${path}"
+}
+
+find_code_mode_host() {
+    local codex_path=""
+    local resolved_codex=""
+    local package_root=""
+    local search_root=""
+    local candidate=""
+
+    CODE_MODE_HOST=""
+    codex_path="$(command -v codex 2>/dev/null || true)"
+    [[ -n "${codex_path}" ]] || return 1
+
+    candidate="$(dirname -- "${codex_path}")/codex-code-mode-host"
+    if [[ -x "${candidate}" ]]; then
+        CODE_MODE_HOST="${candidate}"
+        return 0
+    fi
+
+    resolved_codex="$(resolve_executable "${codex_path}")"
+    candidate="$(dirname -- "${resolved_codex}")/codex-code-mode-host"
+    if [[ -x "${candidate}" ]]; then
+        CODE_MODE_HOST="${candidate}"
+        return 0
+    fi
+
+    if [[ "${resolved_codex}" == */bin/codex.js ]]; then
+        package_root="$(cd -- "$(dirname -- "${resolved_codex}")/.." && pwd)"
+        for search_root in \
+            "${package_root}/node_modules/@openai" \
+            "$(dirname -- "${package_root}")"; do
+            [[ -d "${search_root}" ]] || continue
+            while IFS= read -r candidate; do
+                if [[ -x "${candidate}" ]]; then
+                    CODE_MODE_HOST="${candidate}"
+                    return 0
+                fi
+            done < <(find "${search_root}" -type f -name codex-code-mode-host -print 2>/dev/null)
+        done
+    fi
+
+    return 1
+}
+
+run_brew() {
+    local brew_bin="$1"
+    shift
+
+    if [[ "$(id -u)" == "0" && "${TARGET_USER}" != "root" ]]; then
+        command -v sudo >/dev/null 2>&1 || die "检测到 Homebrew Cask，但缺少 sudo，无法以 ${TARGET_USER} 卸载"
+        sudo -u "${TARGET_USER}" -- "${brew_bin}" "$@"
+    else
+        "${brew_bin}" "$@"
+    fi
+}
+
+remove_conflicting_brew_cask() {
+    local brew_bin=""
+
+    [[ "$(uname -s)" == "Darwin" ]] || return 0
+    brew_bin="$(command -v brew 2>/dev/null || true)"
+    [[ -n "${brew_bin}" ]] || return 0
+    run_brew "${brew_bin}" list --cask codex >/dev/null 2>&1 || return 0
+
+    log "⚠️  检测到 Homebrew Cask codex；为避免缺少 codex-code-mode-host 或 npm 命令冲突，将先卸载 Cask"
+    run_brew "${brew_bin}" uninstall --cask codex
+    hash -r
+}
+
 install_codex() {
     local installed_version=""
 
@@ -98,13 +183,27 @@ install_codex() {
         installed_version="$(codex --version 2>/dev/null || true)"
     fi
     if [[ "${installed_version##* }" == "${CODEX_VERSION}" ]]; then
-        log "✅ Codex CLI ${CODEX_VERSION} 已安装"
-        return
+        if find_code_mode_host; then
+            log "✅ Codex CLI ${CODEX_VERSION} 已安装"
+            log "✅ code-mode host: ${CODE_MODE_HOST}"
+            return
+        fi
+        log "⚠️  Codex CLI ${CODEX_VERSION} 缺少 codex-code-mode-host，将改用 npm 包重新安装"
     fi
 
     command -v npm >/dev/null 2>&1 || die "未找到 npm；请先安装 Node.js/npm，或设置 CODEX_SKIP_INSTALL=1"
+    remove_conflicting_brew_cask
     log "📦 安装 @openai/codex@${CODEX_VERSION} ..."
     npm install -g "@openai/codex@${CODEX_VERSION}"
+    hash -r
+
+    command -v codex >/dev/null 2>&1 || die "npm 安装完成，但 PATH 中仍找不到 codex；请检查 npm global bin"
+    installed_version="$(codex --version 2>/dev/null || true)"
+    [[ "${installed_version##* }" == "${CODEX_VERSION}" ]] \
+        || die "Codex 版本应为 ${CODEX_VERSION}，当前为 ${installed_version:-<无法读取>}"
+    find_code_mode_host \
+        || die "已安装 Codex ${CODEX_VERSION}，但未找到 codex-code-mode-host；请重新安装 @openai/codex"
+    log "✅ code-mode host: ${CODE_MODE_HOST}"
 }
 
 [[ -f "${MODEL_SOURCE}" ]] || die "缺少模型目录: ${MODEL_SOURCE}"

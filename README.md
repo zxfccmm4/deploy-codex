@@ -106,7 +106,24 @@ sudo CODEX_TARGET_USER=alice bash verify.sh
 
 `deploy.sh` 需要系统已有 Node.js/npm；如果 Codex CLI 已通过其他方式安装，可设置 `CODEX_SKIP_INSTALL=1`。覆盖已有 `config.toml` 前会生成带时间戳的备份。
 
-模型目录来自 `@openai/codex@0.147.0` 官方包内嵌目录，并将GPT-5.6 coding 模型的 `use_responses_lite` 设为 `false`。`tool_mode = "code_mode_only"` 会让兼容 Responses API 的代理收到顶层 `type = "custom", name = "exec"` 工具，而 `apply_patch_tool_type = "freeform"` 会在 code mode 中暴露 `apply_patch`，避免把 `exec` 错误编码成 `functions → exec`。
+#### macOS：避免 Homebrew Cask 缺少 code-mode host
+
+[openai/codex#31906](https://github.com/openai/codex/issues/31906#issuecomment-4930014445) 记录过 macOS Homebrew Cask 只安装 `codex`、却缺少 `codex-code-mode-host` 的打包问题。症状通常是所有工具调用都报 `failed to spawn code-mode host`，导致 GPT-5.6 的 `exec` / `apply_patch` 无法使用。
+
+本仓库统一使用 npm 安装 `@openai/codex@0.147.0`。当 `deploy.sh` 需要安装或修复 Codex，且在 macOS 检测到 Homebrew Cask 时，会先执行 `brew uninstall --cask codex`，再安装 npm 包并检查 code-mode host。手工修复命令如下：
+
+```bash
+brew uninstall --cask codex
+npm install -g @openai/codex@0.147.0
+hash -r
+which codex
+codex --version
+bash verify.sh
+```
+
+npm 包中的 helper 可能位于平台包的 `vendor/.../bin/` 内，不一定单独出现在 `PATH`；因此 `command -v codex-code-mode-host` 为空不一定代表安装损坏。`verify.sh` 会同时检查 `PATH`、Codex 同目录和 npm 平台包中的 helper。
+
+模型目录来自 `@openai/codex@0.147.0` 官方包内嵌目录，并将 GPT-5.6 coding 模型的 `use_responses_lite` 设为 `false`。`tool_mode = "code_mode_only"` 会让兼容 Responses API 的代理收到顶层 `type = "custom", name = "exec"` 工具，而 `apply_patch_tool_type = "freeform"` 会在 code mode 中暴露 `apply_patch`，避免把 `exec` 错误编码成 `functions → exec`。
 
 此方案**不会复制、生成或提交 API Key**。请保留目标机器已有的 `~/.codex/auth.json`，或部署后自行执行 `codex login`。如需真实闭环验证：
 

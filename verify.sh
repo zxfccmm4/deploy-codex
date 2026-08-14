@@ -37,6 +37,66 @@ file_mode() {
     fi
 }
 
+resolve_executable() {
+    local path="$1"
+    local link_dir=""
+    local link_target=""
+
+    while [[ -L "${path}" ]]; do
+        link_dir="$(cd -P -- "$(dirname -- "${path}")" && pwd)"
+        link_target="$(readlink "${path}")"
+        if [[ "${link_target}" == /* ]]; then
+            path="${link_target}"
+        else
+            path="${link_dir}/${link_target}"
+        fi
+    done
+
+    printf '%s\n' "${path}"
+}
+
+find_code_mode_host() {
+    local codex_path=""
+    local resolved_codex=""
+    local package_root=""
+    local search_root=""
+    local candidate=""
+
+    CODE_MODE_HOST=""
+    codex_path="$(command -v codex 2>/dev/null || true)"
+    [[ -n "${codex_path}" ]] || return 1
+
+    candidate="$(dirname -- "${codex_path}")/codex-code-mode-host"
+    if [[ -x "${candidate}" ]]; then
+        CODE_MODE_HOST="${candidate}"
+        return 0
+    fi
+
+    resolved_codex="$(resolve_executable "${codex_path}")"
+    candidate="$(dirname -- "${resolved_codex}")/codex-code-mode-host"
+    if [[ -x "${candidate}" ]]; then
+        CODE_MODE_HOST="${candidate}"
+        return 0
+    fi
+
+    if [[ "${resolved_codex}" == */bin/codex.js ]]; then
+        package_root="$(cd -- "$(dirname -- "${resolved_codex}")/.." && pwd)"
+        for search_root in \
+            "${package_root}/node_modules/@openai" \
+            "$(dirname -- "${package_root}")"; do
+            [[ -d "${search_root}" ]] || continue
+            while IFS= read -r candidate; do
+                if [[ -x "${candidate}" ]]; then
+                    CODE_MODE_HOST="${candidate}"
+                    return 0
+                fi
+            done < <(find "${search_root}" -type f -name codex-code-mode-host -print 2>/dev/null)
+        done
+    fi
+
+    return 1
+}
+
 id "${TARGET_USER}" >/dev/null 2>&1 || fail "目标用户不存在: ${TARGET_USER}"
 resolve_home
 CODEX_DIR="${TARGET_HOME}/.codex"
@@ -99,6 +159,16 @@ if [[ "${CODEX_SKIP_VERSION_CHECK:-0}" != "1" ]]; then
     [[ "${version_output##* }" == "${EXPECTED_VERSION}" ]] \
         || fail "Codex 版本应为 ${EXPECTED_VERSION}，当前为 ${version_output}"
     pass "${version_output}"
+
+    if ! find_code_mode_host; then
+        if [[ "$(uname -s)" == "Darwin" ]] \
+            && command -v brew >/dev/null 2>&1 \
+            && brew list --cask codex >/dev/null 2>&1; then
+            fail "Homebrew Cask Codex 缺少 codex-code-mode-host；请运行 brew uninstall --cask codex 后改用 npm 安装"
+        fi
+        fail "未找到 codex-code-mode-host（PATH、Codex 同目录和 npm 平台包均已检查）"
+    fi
+    pass "code-mode host: ${CODE_MODE_HOST}"
 fi
 
 if [[ "${CODEX_LIVE_VERIFY:-0}" == "1" ]]; then
