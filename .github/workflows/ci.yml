@@ -23,18 +23,59 @@ jobs:
           sudo apt-get install -y -qq shellcheck
 
       - name: bash -n
-        run: bash -n deploy-codex.sh
+        run: bash -n deploy-codex.sh deploy.sh verify.sh
 
       - name: ShellCheck
         run: |
           set +e
-          shellcheck -x -S warning deploy-codex.sh
+          shellcheck -x -S warning deploy-codex.sh deploy.sh verify.sh
           code=$?
           set -e
           if [ "$code" -ne 0 ]; then
             echo "::warning::ShellCheck reported issues (exit $code)"
-            shellcheck -x -S style deploy-codex.sh || true
+            shellcheck -x -S style deploy-codex.sh deploy.sh verify.sh || true
           fi
+
+      - name: Portable model catalog validation
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("assets/models-gpt56-non-lite.json")
+          models = {m["slug"]: m for m in json.loads(path.read_text()).get("models", [])}
+          assert {"gpt-5.6-sol", "gpt-5.5"} <= models.keys()
+          for slug in ("gpt-5.6-sol",):
+              assert models[slug]["use_responses_lite"] is False
+              assert models[slug]["tool_mode"] == "code_mode_only"
+              assert models[slug]["apply_patch_tool_type"] == "freeform"
+          PY
+          ! grep -RIE 'sk-[A-Za-z0-9_-]{16,}|Bearer[[:space:]]+[A-Za-z0-9._-]{16,}' \
+            assets templates deploy.sh verify.sh
+
+      - name: Portable deploy smoke
+        run: |
+          tmp=$(mktemp -d)
+          mkdir -p "$tmp/home/.codex"
+          printf 'old-config\n' > "$tmp/home/.codex/config.toml"
+          printf '{"OPENAI_API_KEY":"ci-placeholder"}\n' > "$tmp/home/.codex/auth.json"
+          CODEX_TARGET_USER="$(id -un)" \
+          CODEX_TARGET_HOME="$tmp/home" \
+          CODEX_SKIP_INSTALL=1 \
+            bash deploy.sh
+          CODEX_TARGET_USER="$(id -un)" \
+          CODEX_TARGET_HOME="$tmp/home" \
+          CODEX_SKIP_VERSION_CHECK=1 \
+            bash verify.sh
+          test -f "$tmp/home/.codex/models-gpt56-non-lite.json"
+          test -f "$tmp/home/.codex/config.toml"
+          test -f "$tmp/home/.codex/auth.json"
+          grep -Fq 'ci-placeholder' "$tmp/home/.codex/auth.json"
+          test "$(find "$tmp/home/.codex" -maxdepth 1 -name 'config.toml.bak.*' | wc -l)" -eq 1
+          grep -Fq "model_catalog_json = \"$tmp/home/.codex/models-gpt56-non-lite.json\"" \
+            "$tmp/home/.codex/config.toml"
+          ! grep -Rq '__MODEL_CATALOG_JSON__' "$tmp/home/.codex/config.toml"
+          rm -rf "$tmp"
 
       - name: Help / version smoke
         run: |

@@ -27,6 +27,7 @@
 - **CI**：ShellCheck + `bash -n` + PowerShell 语法检查（`actions/checkout@v5` / Node 24）
 - **dry-run**：`--dry-run` / `-DryRun` 只写配置，不装 Node/npm/codex
 - **卸载清理**：`--uninstall` / `-Uninstall` 删除配置与备份，并尝试 `npm uninstall -g @openai/codex`
+- **跨机器迁移**：仓库内置 GPT-5.6 non-lite 模型目录、配置模板与 `deploy.sh`
 
 ## 快速开始
 
@@ -67,6 +68,54 @@ bash deploy-codex.sh --restore
 bash deploy-codex.sh --version
 bash deploy-codex.sh --dry-run          # 只写配置
 bash deploy-codex.sh --uninstall        # 卸载清理
+```
+
+### 部署到其他机器（推荐）
+
+仓库已包含以下可公开提交的部署文件：
+
+- `assets/models-gpt56-non-lite.json`：Codex CLI `0.147.0` 模型目录，包含 `gpt-5.6-sol` 与审查模型 `gpt-5.5`
+- `templates/config.toml`：无密钥配置模板；部署时自动写入模型目录的**绝对路径**
+- `deploy.sh`：安装固定版本 Codex CLI、复制模型目录并生成 `~/.codex/config.toml`
+- `verify.sh`：检查版本、路径、权限、模型能力；可选发起一次真实工具调用
+
+```bash
+git clone https://github.com/zxfccmm4/deploy-codex.git
+cd deploy-codex
+bash deploy.sh
+bash verify.sh
+```
+
+Linux 下使用 `sudo` 时，脚本默认部署到 `SUDO_USER`，不会误写到 `/root/.codex`：
+
+```bash
+sudo CODEX_TARGET_USER=alice bash deploy.sh
+sudo CODEX_TARGET_USER=alice bash verify.sh
+```
+
+可用环境变量：
+
+| 环境变量 | 说明 | 默认 |
+|---------|------|------|
+| `CODEX_TARGET_USER` | 接收配置的系统用户 | `SUDO_USER` 或当前用户 |
+| `CODEX_TARGET_HOME` | 显式指定目标家目录（适合 CI） | 从系统用户信息解析 |
+| `CODEX_VERSION` | 安装并验证的 Codex CLI 版本 | `0.147.0` |
+| `CODEX_SKIP_INSTALL=1` | 只部署目录与配置，不执行 npm 全局安装 | `0` |
+| `CODEX_SKIP_VERSION_CHECK=1` | 验证时跳过 CLI 版本检查 | `0` |
+| `CODEX_LIVE_VERIFY=1` | 验证时发起真实 API 请求，并要求模型实际调用 `exec` | `0` |
+
+`deploy.sh` 需要系统已有 Node.js/npm；如果 Codex CLI 已通过其他方式安装，可设置 `CODEX_SKIP_INSTALL=1`。覆盖已有 `config.toml` 前会生成带时间戳的备份。
+
+模型目录来自 `@openai/codex@0.147.0` 官方包内嵌目录，并将GPT-5.6 coding 模型的 `use_responses_lite` 设为 `false`。`tool_mode = "code_mode_only"` 会让兼容 Responses API 的代理收到顶层 `type = "custom", name = "exec"` 工具，而 `apply_patch_tool_type = "freeform"` 会在 code mode 中暴露 `apply_patch`，避免把 `exec` 错误编码成 `functions → exec`。
+
+此方案**不会复制、生成或提交 API Key**。请保留目标机器已有的 `~/.codex/auth.json`，或部署后自行执行 `codex login`。如需真实闭环验证：
+
+```bash
+CODEX_LIVE_VERIFY=1 bash verify.sh
+
+# 也可手工询问；预期包含 exec、apply_patch 等工具名
+codex exec --ephemeral --skip-git-repo-check \
+  '你现在可以使用的终端工具有哪些？只列出工具名。'
 ```
 
 ### Windows（PowerShell）
@@ -191,12 +240,13 @@ pwsh -File deploy-codex.ps1 -Uninstall -NonInteractive
 - `auth.json` / `config.toml` 权限 `600`（Windows 为当前用户 ACL）
 - 写入前自动备份；失败时原配置不被破坏（原子替换）
 - 临时文件在中断时自动清理
+- 可迁移模型目录与模板不含 API Key；`deploy.sh` 不读写 `auth.json`
 
 ## 开发与 CI
 
 ```bash
-bash -n deploy-codex.sh
-shellcheck -x deploy-codex.sh   # 可选
+bash -n deploy-codex.sh deploy.sh verify.sh
+shellcheck -x deploy-codex.sh deploy.sh verify.sh   # 可选
 bash deploy-codex.sh --help
 ```
 
